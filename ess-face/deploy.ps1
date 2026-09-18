@@ -14,6 +14,9 @@
 #   deploy.config.json          - non-secret settings (install path, ports, repos)
 #   deploy.secrets.json         - DB/SMTP credentials (auto-added to .gitignore)
 #   deploy.secrets.example.json - template with placeholder values
+# Runtime folders created by default:
+#   <drive>:\ESS\Ess_Face              - app services and runtime
+#   <drive>:\ESS\storage\employee-faces - persistent face profile images
 # ===========================================================
 
 #Requires -RunAsAdministrator
@@ -53,18 +56,17 @@ $SecretsExamplePath = Join-Path $ScriptRoot "deploy.secrets.example.json"
 # ---------- DEFAULT CONFIG ----------
 $DefaultConfig = @{
     Environment = "production"
-    FrontendRepo = "https://github.com/Posuza/ESS_MO_Fronend.git"
+    FrontendRepo = "https://github.com/Posuza/ESS-Face-Frontend.git"
     FrontendBranch = "main"
-    BackendRepo  = "https://github.com/Posuza/ESS_MO_Backend.git"
+    BackendRepo  = "https://github.com/Posuza/ESS-Face-Backend.git"
     BackendBranch = "main"
-    FrontendPort = 3009
-    BackendPort  = 8009
-    CaddyPort    = 9089
-    CaddyAdminPort = 2019
+    FrontendPort = 3110
+    BackendPort  = 8110
+    CaddyPort    = 9110
+    CaddyAdminPort = 2110
     ApiPrefix    = "/api/v1"
-    MoReportWorkerPollSeconds = 5
-    MoReportRetentionMinutes  = 1
-    MoReportSweepMinutes      = 0.1
+    FrontendPublicUrl = $null
+    MediaStoragePath = $null
     InstallRoot  = $null
 }
 
@@ -87,17 +89,17 @@ function Get-DeployEnvironment {
 function Get-InstallFolderName {
     param($Config)
     if ((Get-DeployEnvironment -Config $Config) -eq "development") {
-        return "Ess_MO_dev"
+        return "Ess_Face_dev"
     }
-    return "Ess_Mo"
+    return "Ess_Face"
 }
 
 function Get-ServicePrefix {
     param($Config)
     if ((Get-DeployEnvironment -Config $Config) -eq "development") {
-        return "ess-mo-dev"
+        return "ess-face-dev"
     }
-    return "ess-mo"
+    return "ess-face"
 }
 
 function Get-DeployServiceName {
@@ -311,9 +313,8 @@ function Get-DeployConfig {
             'CaddyAdminPort',
             'FrontendPort',
             'BackendPort',
-            'MoReportWorkerPollSeconds',
-            'MoReportRetentionMinutes',
-            'MoReportSweepMinutes'
+            'FrontendPublicUrl',
+            'MediaStoragePath'
         ) | ForEach-Object {
             if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
                 Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
@@ -368,7 +369,7 @@ function Select-InstallDrive {
             Write-Log "Configured drive $drive not found among available drives" -Level "ERROR"
             return $null
         }
-        $newRoot = "$driveLetter`:\$installFolder"
+        $newRoot = "$driveLetter`:\ESS\$installFolder"
         if ($Config.InstallRoot -ne $newRoot) {
             $Config.InstallRoot = $newRoot
             Save-DeployConfig -Config $Config
@@ -416,7 +417,7 @@ function Select-InstallDrive {
         $valid = $true
     } while (-not $valid)
 
-    $newRoot = "$choice`:\$installFolder"
+    $newRoot = "$choice`:\ESS\$installFolder"
 
     if (-not $hasCurrent -or $newRoot -ne $Config.InstallRoot) {
         $Config.InstallRoot = $newRoot
@@ -434,7 +435,7 @@ function Select-CaddyPort {
     if ($script:headless) {
         # Headless: use whatever is in config or default
         if (-not $Config.CaddyPort -or $Config.CaddyPort -eq 0) {
-            $Config.CaddyPort = 9089
+            $Config.CaddyPort = 9110
         }
         return $Config.CaddyPort
     }
@@ -459,7 +460,7 @@ function Select-CaddyPort {
         }
     }
 
-    $defaultPort = if ($hasCurrent) { $Config.CaddyPort } else { 9089 }
+    $defaultPort = if ($hasCurrent) { $Config.CaddyPort } else { 9110 }
     $valid = $false
     do {
         $prompt = "Enter new Caddy port [$defaultPort]"
@@ -499,6 +500,80 @@ function Initialize-InstallRoot {
     Write-Log "Install root created at $($Config.InstallRoot)"
 }
 
+function Test-AppInstallRoot {
+    param($Config)
+    $installRoot = "$($Config.InstallRoot)"
+    if ([string]::IsNullOrWhiteSpace($installRoot)) {
+        return $false
+    }
+    $leaf = Split-Path -Path $installRoot -Leaf
+    $parent = Split-Path -Path $installRoot -Parent
+    $parentLeaf = Split-Path -Path $parent -Leaf
+    return ($leaf -eq (Get-InstallFolderName -Config $Config) -and $parentLeaf -eq "ESS")
+}
+
+function Get-EssRootPath {
+    param($Config)
+    $installRoot = "$($Config.InstallRoot)"
+    if ([string]::IsNullOrWhiteSpace($installRoot)) {
+        return "C:\ESS"
+    }
+    return (Split-Path -Path $installRoot -Parent)
+}
+
+function Get-MediaStoragePath {
+    param($Config)
+    $configuredPath = $null
+    if ($Config | Get-Member -Name "MediaStoragePath" -ErrorAction SilentlyContinue) {
+        $configuredPath = "$($Config.MediaStoragePath)"
+    }
+    if ([string]::IsNullOrWhiteSpace($configuredPath)) {
+        return (Join-Path (Get-EssRootPath -Config $Config) "storage")
+    }
+    $expandedPath = [Environment]::ExpandEnvironmentVariables($configuredPath.Trim())
+    if ([System.IO.Path]::IsPathRooted($expandedPath)) {
+        return $expandedPath
+    }
+    return (Join-Path (Get-EssRootPath -Config $Config) $expandedPath)
+}
+
+function Convert-ToEnvPath {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    return ($Path -replace '\\', '/')
+}
+
+function Get-FaceImagesDirectory {
+    param([Parameter(Mandatory=$true)][string]$MediaRoot)
+    if ((Split-Path -Path $MediaRoot -Leaf) -ieq "employee-faces") {
+        return $MediaRoot
+    }
+    return (Join-Path $MediaRoot "employee-faces")
+}
+
+function Get-FrontendPublicUrl {
+    param($Config)
+    if ($Config | Get-Member -Name "FrontendPublicUrl" -ErrorAction SilentlyContinue) {
+        $configuredUrl = "$($Config.FrontendPublicUrl)"
+        if (-not [string]::IsNullOrWhiteSpace($configuredUrl)) {
+            return $configuredUrl.Trim().TrimEnd('/')
+        }
+    }
+    return "http://localhost:$($Config.CaddyPort)"
+}
+
+function Initialize-MediaStorage {
+    param($Config)
+    $mediaRoot = Get-MediaStoragePath -Config $Config
+    $facesDir = Get-FaceImagesDirectory -MediaRoot $mediaRoot
+    if ($script:dryRun) {
+        Write-Warn "[DRY-RUN] Would create media storage: $facesDir"
+        return $mediaRoot
+    }
+    New-Item -Path $facesDir -ItemType Directory -Force | Out-Null
+    Write-Log "Media storage ready: $mediaRoot (face images: $facesDir)"
+    return $mediaRoot
+}
+
 # ===========================================================
 # SECRETS (DB / SMTP credentials, stored outside the script)
 # Nested structure: db.host, db.port, db.name, db.user, db.password
@@ -527,9 +602,9 @@ function Get-SecretsDefaults {
     Write-Log "Using default secrets (not production-ready)" -Level "WARN"
     return [PSCustomObject]@{
         db = [PSCustomObject]@{
-            host     = "192.168.1.172"
+            host     = "localhost"
             port     = 3306
-            name     = "ess"
+            name     = "ess_face"
             user     = "root"
             password = ""
         }
@@ -611,7 +686,7 @@ function Get-SecretsOrInitialize {
     .SYNOPSIS
       Load secrets from deploy.secrets.json.
       If missing or placeholders found, offers interactive fill.
-      If declined, creates/overwrites with defaults — install never blocks.
+      If placeholders remain, backend deployment is cancelled until the file is updated.
     #>
 
     $s = $null
@@ -630,9 +705,9 @@ function Get-SecretsOrInitialize {
     if ($s) {
         # File exists — check for placeholder values
         $placeholders = @()
-        if ($s.db.host     -match $placeholderPattern) { $placeholders += '  db.host (e.g. "192.168.1.172")' }
+        if ($s.db.host     -match $placeholderPattern) { $placeholders += '  db.host (e.g. "localhost" or your MySQL server address)' }
         if ($s.db.user     -match $placeholderPattern) { $placeholders += '  db.user (e.g. "root")' }
-        if ($s.db.name     -match $placeholderPattern) { $placeholders += '  db.name (e.g. "ess")' }
+        if ($s.db.name     -match $placeholderPattern) { $placeholders += '  db.name (e.g. "ess_face")' }
         if ($s.db.password -match $placeholderPattern) { $placeholders += '  db.password (your MySQL password)' }
         if ($s.smtp.user   -match $placeholderPattern) { $placeholders += '  smtp.user (your email)' }
         if ($s.smtp.pass   -match $placeholderPattern) { $placeholders += '  smtp.pass (app password)' }
@@ -656,6 +731,7 @@ function Get-SecretsOrInitialize {
             Write-Host "  db.password (your MySQL password)" -ForegroundColor Gray
             Write-Host "  smtp.user   (your email)" -ForegroundColor Gray
             Write-Host "  smtp.pass   (your SMTP app password)" -ForegroundColor Gray
+            Write-Host "  smtp.from   (from address)" -ForegroundColor Gray
             Write-Host ""
 
             if (-not $script:headless) {
@@ -982,19 +1058,12 @@ function Verify-Health {
     param($Config)
     $allOk = $true
     $backendSvcName = Get-DeployServiceName -Config $Config -Component "backend"
-    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
     $frontendSvcName = Get-DeployServiceName -Config $Config -Component "frontend"
     $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     Write-Step "Verifying service health"
 
     if (Get-Service -Name $backendSvcName -ErrorAction SilentlyContinue) {
         if (-not (Test-Endpoint -Url "http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)/health" -Name "Backend API")) { $allOk = $false }
-    }
-    $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
-    if ($workerSvc -and $workerSvc.Status -ne 'Running') {
-        Write-Err "MO report worker: not running"
-        Write-Log "Health check failed: $workerSvcName status=$($workerSvc.Status)" -Level "ERROR"
-        $allOk = $false
     }
     if (Get-Service -Name $frontendSvcName -ErrorAction SilentlyContinue) {
         if (-not (Test-Endpoint -Url "http://localhost:$($Config.FrontendPort)" -Name "Frontend")) { $allOk = $false }
@@ -1067,6 +1136,8 @@ function Install-Frontend {
             if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
             git reset --hard "origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
             if ($LASTEXITCODE -ne 0) { throw "git reset failed with exit code $LASTEXITCODE" }
+            git clean -fd 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "git clean failed with exit code $LASTEXITCODE" }
             Pop-Location
         } else {
             Write-Host "    Cloning repo (first time)..." -ForegroundColor Gray
@@ -1348,7 +1419,6 @@ function Install-Backend {
     $appDir   = Join-Path $Config.InstallRoot "backend"
     $repoDir  = Join-Path $appDir "repo"
     $svcName  = Get-DeployServiceName -Config $Config -Component "backend"
-    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
     $appPort  = $Config.BackendPort
 
     function Invoke-BackendLoggedCommand {
@@ -1494,8 +1564,8 @@ function Install-Backend {
         Write-FileLog -Path $installLog -Text "RepoDir: $repoDir"
         Write-FileLog -Path $installLog -Text "Port: $appPort"
 
-        # --- 0. Stop/uninstall API and worker services before touching repo/venv ---
-        Stop-BackendRuntime -ServiceNames @($svcName, $workerSvcName) -AppDir $appDir -RepoDir $repoDir -LogPath $installLog
+        # --- 0. Stop/uninstall API service before touching repo/venv ---
+        Stop-BackendRuntime -ServiceNames @($svcName) -AppDir $appDir -RepoDir $repoDir -LogPath $installLog
 
         # --- 1. Clone or hard-reset backend repo ---
         if (Test-Path (Join-Path $repoDir ".git")) {
@@ -1505,6 +1575,7 @@ function Install-Backend {
             try {
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --depth 1 --prune origin "+refs/heads/$($Config.BackendBranch):refs/remotes/origin/$($Config.BackendBranch)" }
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git reset" -Command { git reset --hard "origin/$($Config.BackendBranch)" }
+                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git clean" -Command { git clean -fd }
             } finally {
                 Pop-Location
             }
@@ -1566,6 +1637,10 @@ function Install-Backend {
 
         # --- 4. Generate .env file before app import verification ---
         Write-Host "    Generating .env file..." -ForegroundColor Gray
+        $mediaStoragePath = Initialize-MediaStorage -Config $Config
+        $envMediaStoragePath = Convert-ToEnvPath -Path $mediaStoragePath
+        Write-Host "    Media storage: $mediaStoragePath" -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Media storage path: $mediaStoragePath"
         $rawKey = & $pythonExe -c "import secrets; print(secrets.token_hex(32))" 2>&1
         $generatedKey = ($rawKey | Select-Object -Last 1).Trim()
         if ([string]::IsNullOrWhiteSpace($generatedKey) -or $generatedKey.Length -lt 16) {
@@ -1579,14 +1654,18 @@ function Install-Backend {
         $envDbPass   = $Secrets.db.password.Replace('\', '\\').Replace('"', '\"')
         $envDbHost   = $Secrets.db.host.Replace('\', '\\').Replace('"', '\"')
         $envDbName   = $Secrets.db.name.Replace('\', '\\').Replace('"', '\"')
+        $envDbPort   = [int]$Secrets.db.port
+        $envSmtpHost = $Secrets.smtp.host.Replace('\', '\\').Replace('"', '\"')
+        $envSmtpPort = [int]$Secrets.smtp.port
         $envSmtpUser = $Secrets.smtp.user.Replace('\', '\\').Replace('"', '\"')
         $envSmtpPass = $Secrets.smtp.pass.Replace('\', '\\').Replace('"', '\"')
         $envSmtpFrom = $Secrets.smtp.from.Replace('\', '\\').Replace('"', '\"')
+        $envFrontendUrl = (Get-FrontendPublicUrl -Config $Config).Replace('\', '\\').Replace('"', '\"')
 
         $envContent = @"
 DB_ENGINE=mysql
 DB_HOST=$envDbHost
-DB_PORT=3306
+DB_PORT=$envDbPort
 DB_USER="$envDbUser"
 DB_PASSWORD="$envDbPass"
 DB_NAME=$envDbName
@@ -1595,16 +1674,16 @@ SECRET_KEY=$generatedKey
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
+SMTP_HOST=$envSmtpHost
+SMTP_PORT=$envSmtpPort
 SMTP_USER="$envSmtpUser"
 SMTP_PASS="$envSmtpPass"
 EMAIL_FROM="$envSmtpFrom"
+FRONTEND_URL="$envFrontendUrl"
+RESET_EXPIRE_MINUTES=15
+MFA_ISSUER_NAME="ESS Face"
 
-MO_REPORT_EXPORT_WORKER_POLL_SECONDS=$($Config.MoReportWorkerPollSeconds)
-MO_REPORT_EXPORT_RETENTION_MINUTES=$($Config.MoReportRetentionMinutes)
-MO_REPORT_EXPORT_SWEEP_INTERVAL_MINUTES=$($Config.MoReportSweepMinutes)
-MO_REPORT_EXPORT_WORKER_LOG_LEVEL=INFO
+MEDIA_STORAGE_PATH="$envMediaStoragePath"
 "@
         Set-Content -Path (Join-Path $repoDir ".env") -Value $envContent -Force -Encoding UTF8
         Write-FileLog -Path $installLog -Text ".env generated with SECRET_KEY ($($generatedKey.Length) chars)"
@@ -1626,19 +1705,6 @@ MO_REPORT_EXPORT_WORKER_LOG_LEVEL=INFO
             $appImportCheckText = $appImportCheck -join " | "
             if ($LASTEXITCODE -ne 0 -or $appImportCheckText -notmatch "APP_IMPORT_OK") {
                 throw "FastAPI app import verification failed: $appImportCheckText"
-            }
-        } finally {
-            Pop-Location
-        }
-
-        Write-Host "    Verifying MO report worker import..." -ForegroundColor Gray
-        Push-Location $repoDir
-        try {
-            $workerImportCheck = & $pythonExe -X faulthandler -c "import app.workers.mo_report_export_worker; print('WORKER_IMPORT_OK')" 2>&1
-            Write-FileLog -Path $installLog -Text "Worker import check output: $($workerImportCheck -join ' | ')"
-            $workerImportCheckText = $workerImportCheck -join " | "
-            if ($LASTEXITCODE -ne 0 -or $workerImportCheckText -notmatch "WORKER_IMPORT_OK") {
-                throw "MO report worker import verification failed: $workerImportCheckText"
             }
         } finally {
             Pop-Location
@@ -1714,78 +1780,9 @@ catch {
         Set-Content -Path $runnerScript -Value $runnerContent -Force -Encoding UTF8
         Write-FileLog -Path $installLog -Text "Runner script written to $runnerScript"
 
-        $workerRunnerScript = Join-Path $appDir "mo-report-worker-run.ps1"
-        $workerRunnerContent = @'
-$ErrorActionPreference = "Continue"
-$ProgressPreference = "SilentlyContinue"
-$env:PYTHONUNBUFFERED = "1"
-$env:PYTHONFAULTHANDLER = "1"
-
-$backendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoDir    = Join-Path $backendDir "repo"
-$venvDir    = Join-Path $repoDir "venv"
-$pythonExe  = Join-Path $venvDir "Scripts\python.exe"
-$logsDir    = Join-Path (Join-Path (Split-Path $backendDir -Parent) "logs") "backend"
-if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
-
-$svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
-$serviceLog = Join-Path $logsDir "mo_report_worker_service_${svcTs}.log"
-$stdoutLog = Join-Path $logsDir "mo_report_worker_stdout_${svcTs}.log"
-$stderrLog = Join-Path $logsDir "mo_report_worker_stderr_${svcTs}.log"
-
-"========== Worker service started at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Encoding ASCII
-
-if (-not (Test-Path $pythonExe)) {
-    "FATAL: python.exe not found at $pythonExe" | Out-File -FilePath $serviceLog -Append
-    exit 1
-}
-
-try {
-    Set-Location -Path $repoDir -ErrorAction Stop
-} catch {
-    "FATAL: could not cd to $repoDir : $_" | Out-File -FilePath $serviceLog -Append
-    exit 1
-}
-
-"    Working directory: $(Get-Location)" | Out-File -FilePath $serviceLog -Append
-"    Worker: -X faulthandler -u -m app.workers.mo_report_export_worker" | Out-File -FilePath $serviceLog -Append
-"    Stdout log: $stdoutLog" | Out-File -FilePath $serviceLog -Append
-"    Stderr log: $stderrLog" | Out-File -FilePath $serviceLog -Append
-
-$importCheck = & $pythonExe -X faulthandler -c "import app.workers.mo_report_export_worker; print('WORKER_RUNTIME_OK')" 2>&1
-"    Import check: $($importCheck -join ' | ')" | Out-File -FilePath $serviceLog -Append
-$importCheckText = $importCheck -join " | "
-if ($LASTEXITCODE -ne 0 -or $importCheckText -notmatch "WORKER_RUNTIME_OK") {
-    "FATAL: worker import failed: $importCheckText" | Out-File -FilePath $serviceLog -Append
-    exit 1
-}
-
-$workerExitCode = 1
-try {
-    $p = Start-Process -FilePath $pythonExe `
-        -ArgumentList @("-X", "faulthandler", "-u", "-m", "app.workers.mo_report_export_worker") `
-        -WorkingDirectory $repoDir `
-        -RedirectStandardOutput $stdoutLog `
-        -RedirectStandardError $stderrLog `
-        -NoNewWindow -Wait -PassThru
-    $workerExitCode = $p.ExitCode
-    "    Worker exit code: $workerExitCode" | Out-File -FilePath $serviceLog -Append
-}
-catch {
-    "FATAL: worker launch threw: $_" | Out-File -FilePath $serviceLog -Append
-    $workerExitCode = 1
-}
-
-"========== Worker service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $serviceLog -Append
-exit $workerExitCode
-'@
-        Set-Content -Path $workerRunnerScript -Value $workerRunnerContent -Force -Encoding UTF8
-        Write-FileLog -Path $installLog -Text "Worker runner script written to $workerRunnerScript"
-
         # --- 7. Create backend service ---
         $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
-        $workerParamStr = "-ExecutionPolicy Bypass -File `"$workerRunnerScript`""
 
         Write-FileLog -Path $installLog -Text "--- Service creation ---"
         Write-FileLog -Path $installLog -Text "Service name: $svcName"
@@ -1813,55 +1810,11 @@ exit $workerExitCode
         Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
         Write-Success "Service updated: $svcName"
 
-        Write-FileLog -Path $installLog -Text "--- Worker service creation ---"
-        Write-FileLog -Path $installLog -Text "Service name: $workerSvcName"
-        Write-FileLog -Path $installLog -Text "Parameters: $workerParamStr"
-        servy-cli install --name="$workerSvcName" --path="$powershellExe" --params="$workerParamStr" 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) {
-            throw "Worker servy-cli install failed with exit code $LASTEXITCODE"
-        }
-        if (-not (Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue)) {
-            throw "Service '$workerSvcName' was not created by servy-cli"
-        }
-        sc.exe config "$workerSvcName" start= delayed-auto 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to configure service '$workerSvcName' for delayed automatic startup"
-        }
-        sc.exe failure "$workerSvcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service '$workerSvcName'" }
-        sc.exe failureflag "$workerSvcName" 1 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service '$workerSvcName'" }
-        Write-FileLog -Path $installLog -Text "Service $workerSvcName startup type set to Automatic (Delayed Start)"
-        Write-FileLog -Path $installLog -Text "Service $workerSvcName recovery actions configured"
-        Write-Success "Service updated: $workerSvcName"
-
         # --- 8. Start service and verify health endpoint ---
         Write-Host "    Starting backend service to verify..." -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Starting backend service..."
         Start-Service -Name $svcName -ErrorAction Stop
         Write-FileLog -Path $installLog -Text "Start-Service command issued"
-
-        Write-Host "    Starting MO report worker service to verify..." -ForegroundColor Gray
-        Start-Service -Name $workerSvcName -ErrorAction Stop
-        Start-Sleep -Seconds 2
-        $workerSvcStatus = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
-        if (-not $workerSvcStatus -or $workerSvcStatus.Status -ne 'Running') {
-            foreach ($pattern in @("mo_report_worker_service_*.log", "mo_report_worker_stdout_*.log", "mo_report_worker_stderr_*.log")) {
-                $latestWorkerLog = Get-ChildItem -Path $logsDir -Filter $pattern -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                if ($latestWorkerLog) {
-                    Write-FileLog -Path $installLog -Text "--- Last 80 lines of $($latestWorkerLog.Name) ---"
-                    Get-Content $latestWorkerLog.FullName -ErrorAction SilentlyContinue | Select-Object -Last 80 | ForEach-Object {
-                        Write-FileLog -Path $installLog -Text $_
-                        Write-Host "    [WORKER LOG] $_" -ForegroundColor Red
-                    }
-                    Write-FileLog -Path $installLog -Text "--- end $($latestWorkerLog.Name) ---"
-                }
-            }
-            throw "MO report worker service did not remain running"
-        }
-        Write-Success "MO report worker service is running"
-        Write-FileLog -Path $installLog -Text "Worker service status: $($workerSvcStatus.Status)"
 
         $healthUrl = "http://127.0.0.1:$appPort/api/v1/health"
         $healthOk = $false
@@ -1909,7 +1862,7 @@ exit $workerExitCode
         Write-FileLog -Path $installLog -Text "Backend verification complete"
 
         $script:installedComponents += "backend"
-        Write-Log "Backend and MO report worker installed/updated successfully on port $appPort"
+        Write-Log "Backend installed/updated successfully on port $appPort"
         return $true
 
     } catch {
@@ -2419,22 +2372,9 @@ function Get-Components {
     )
 }
 
-function Get-WorkerComponent {
-    param($Config)
-    return [PSCustomObject]@{
-        Num = 4
-        Key = "report-worker"
-        Service = (Get-DeployServiceName -Config $Config -Component "report-worker")
-        Display = "MO Report Worker"
-    }
-}
-
 function Get-ServiceComponents {
     param($Config)
-    return @(
-        Get-Components -Config $Config
-        Get-WorkerComponent -Config $Config
-    )
+    return Get-Components -Config $Config
 }
 
 function Invoke-ComponentInstall {
@@ -2473,26 +2413,6 @@ function Remove-Component {
     Write-FileLog -Path $uninstallLog -Text "========== Uninstalling $Key =========="
 
     if (-not $script:dryRun) {
-        # The MO report worker shares the backend repo and venv, so remove it first.
-        if ($Key -eq "backend") {
-            $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
-            $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
-            if ($workerSvc) {
-                if ($workerSvc.Status -ne 'Stopped') {
-                    Write-Host "    Stopping service $workerSvcName..." -ForegroundColor Gray
-                    Stop-Service -Name $workerSvcName -Force -ErrorAction Stop
-                    $workerSvc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
-                }
-                servy-cli uninstall --name="$workerSvcName" --quiet 2>&1 | Add-FileLog -Path $uninstallLog
-                Start-Sleep -Milliseconds 500
-                if (Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue) {
-                    throw "Worker service '$workerSvcName' could not be uninstalled."
-                }
-                Write-Success "$workerSvcName service removed."
-                Write-FileLog -Path $uninstallLog -Text "OK: $workerSvcName removed"
-            }
-        }
-
         # --- Step 1: Stop the service (if running) — no force-kill, no silent skip ---
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc) {
@@ -2587,7 +2507,6 @@ function Remove-Component {
 # ===========================================================
 function Start-AllServices {
     param($Config)
-    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
     $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     Write-Step "Starting services"
     if ($script:dryRun) {
@@ -2613,16 +2532,6 @@ function Start-AllServices {
             Write-Log "Failed to start $($c.Service): $_" -Level "ERROR"
         }
     }
-    $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
-    if ($workerSvc) {
-        try {
-            Start-Service -Name $workerSvcName -ErrorAction Stop
-            Write-Success "Started MO Report Worker"
-            Write-Log "Service started: $workerSvcName"
-        } catch {
-            Write-Err "Failed to start MO Report Worker: $_"
-        }
-    }
     # Show ports after Caddy starts (give runner time to write status file)
     if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
         Start-Sleep -Seconds 3
@@ -2640,16 +2549,10 @@ function Start-AllServices {
 
 function Stop-AllServices {
     param($Config)
-    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
     Write-Step "Stopping services"
     if ($script:dryRun) {
         Write-Warn "[DRY-RUN] Would stop all running services"
         return
-    }
-    if (Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue) {
-        Stop-Service -Name $workerSvcName -ErrorAction SilentlyContinue
-        Write-Success "Stopped MO Report Worker"
-        Write-Log "Service stopped: $workerSvcName"
     }
     foreach ($c in Get-Components -Config $Config) {
         if (-not (Get-Service -Name $c.Service -ErrorAction SilentlyContinue)) { continue }
@@ -2661,7 +2564,6 @@ function Stop-AllServices {
 
 function Show-Status {
     param($Config)
-    $workerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
     $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     Write-Step "Service status"
     $rows = foreach ($c in Get-Components -Config $Config) {
@@ -2671,12 +2573,6 @@ function Show-Status {
             Service   = $c.Service
             State     = if ($svc) { $svc.Status } else { "Not installed" }
         }
-    }
-    $workerSvc = Get-Service -Name $workerSvcName -ErrorAction SilentlyContinue
-    $rows += [PSCustomObject]@{
-        Component = "MO Report Worker"
-        Service   = $workerSvcName
-        State     = if ($workerSvc) { $workerSvc.Status } else { "Not installed" }
     }
     $rows | Format-Table -AutoSize | Out-Host
 
@@ -3197,7 +3093,6 @@ function Select-Component {
 # ENTRY POINT
 # ===========================================================
 $Config = Get-DeployConfig
-$menuWorkerSvcName = Get-DeployServiceName -Config $Config -Component "report-worker"
 
 if ($script:headless) {
     # Non-interactive mode - validate drive then run
@@ -3241,10 +3136,6 @@ do {
                     Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray
                 }
             }
-            $workerEntry = Get-WorkerComponent -Config $Config
-            $workerSvc = Get-Service -Name $workerEntry.Service -ErrorAction SilentlyContinue
-            $workerState = if ($workerSvc) { $workerSvc.Status } else { "NOT INSTALLED" }
-            Write-Host "    + $($workerEntry.Display) [$workerState; managed with Backend]" -ForegroundColor Gray
             Write-Host "  B) Back" -ForegroundColor Gray
             $sub = Read-Host "`nSelect to install"
             if ($sub -match '^[Aa]$') {
@@ -3279,10 +3170,6 @@ do {
                     Write-Host "  [NOT INSTALLED]" -ForegroundColor DarkGray
                 }
             }
-            $workerEntry = Get-WorkerComponent -Config $Config
-            $workerSvc = Get-Service -Name $workerEntry.Service -ErrorAction SilentlyContinue
-            $workerState = if ($workerSvc) { $workerSvc.Status } else { "NOT INSTALLED" }
-            Write-Host "    + $($workerEntry.Display) [$workerState; removed with Backend]" -ForegroundColor Gray
             Write-Host " B) Back" -ForegroundColor Gray
             $sub = Read-Host "`nSelect to uninstall"
             if ($sub -match '^[Aa]$') {
@@ -3303,23 +3190,25 @@ do {
                         foreach ($c in $compList) {
                             Remove-Component -Key $c.Key -Config $Config -DeleteFiles:$delFiles
                         }
-                        # Then ask about logs and root folder
-                        if ($delFiles -and (Confirm-Step "Delete logs/ folder and $($Config.InstallRoot) root folder too?" -DefaultYes:$false)) {
+                        # Then ask about logs and the app folder only. Persistent storage is outside InstallRoot.
+                        if ($delFiles -and (Confirm-Step "Delete logs/ folder and app folder $($Config.InstallRoot) too? Storage is preserved." -DefaultYes:$false)) {
                             $logsPath = Join-Path $Config.InstallRoot "logs"
                             if (Test-Path $logsPath) {
                                 Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
                                 Write-Success "Deleted logs/ folder"
                             }
-                            if ((Test-Path $Config.InstallRoot) -and ($Config.InstallRoot -match '\\[^\\]+$')) {
+                            if ((Test-Path $Config.InstallRoot) -and (Test-AppInstallRoot -Config $Config)) {
                                 # Only delete root if it's empty (after removing component + logs folders)
                                 $remaining = Get-ChildItem $Config.InstallRoot -ErrorAction SilentlyContinue
                                 if (-not $remaining) {
                                     Remove-Item $Config.InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
-                                    Write-Success "Deleted root folder: $($Config.InstallRoot)"
+                                    Write-Success "Deleted app folder: $($Config.InstallRoot)"
                                 } else {
-                                    Write-Warn "Root folder not empty, skipping: $($Config.InstallRoot)"
+                                    Write-Warn "App folder not empty, skipping: $($Config.InstallRoot)"
                                     Write-Host "    Remaining items: $($remaining.Name -join ', ')" -ForegroundColor Gray
                                 }
+                            } else {
+                                Write-Warn "InstallRoot does not look like an ESS app folder. Skipping folder delete: $($Config.InstallRoot)"
                             }
                         }
                     }
@@ -3388,14 +3277,6 @@ do {
                         }
                         Write-Log "Started $($c.Display)"
                     }
-                    if ($c.Key -eq "backend" -and $svc) {
-                        $workerSvc = Get-Service -Name $menuWorkerSvcName -ErrorAction SilentlyContinue
-                        if ($workerSvc -and $workerSvc.Status -ne 'Running') {
-                            Start-Service -Name $menuWorkerSvcName -ErrorAction Stop
-                            Write-Success "Started MO Report Worker"
-                            Write-Log "Started MO Report Worker"
-                        }
-                    }
                 }
             }
         }
@@ -3435,14 +3316,6 @@ do {
                         Stop-Service -Name $c.Service -ErrorAction Stop
                         Write-Success "Stopped $($c.Display)"
                         Write-Log "Stopped $($c.Display)"
-                    }
-                    if ($c.Key -eq "backend") {
-                        $workerSvc = Get-Service -Name $menuWorkerSvcName -ErrorAction SilentlyContinue
-                        if ($workerSvc -and $workerSvc.Status -eq 'Running') {
-                            Stop-Service -Name $menuWorkerSvcName -ErrorAction Stop
-                            Write-Success "Stopped MO Report Worker"
-                            Write-Log "Stopped MO Report Worker"
-                        }
                     }
                 }
             }
