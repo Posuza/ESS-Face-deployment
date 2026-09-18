@@ -678,7 +678,7 @@ function Get-SecretsOrInitialize {
     .SYNOPSIS
       Load secrets from deploy.secrets.json.
       If missing or placeholders found, offers interactive fill.
-      If declined, creates/overwrites with defaults — install never blocks.
+      If placeholders remain, backend deployment is cancelled until the file is updated.
     #>
 
     $s = $null
@@ -723,6 +723,7 @@ function Get-SecretsOrInitialize {
             Write-Host "  db.password (your MySQL password)" -ForegroundColor Gray
             Write-Host "  smtp.user   (your email)" -ForegroundColor Gray
             Write-Host "  smtp.pass   (your SMTP app password)" -ForegroundColor Gray
+            Write-Host "  smtp.from   (from address)" -ForegroundColor Gray
             Write-Host ""
 
             if (-not $script:headless) {
