@@ -30,7 +30,7 @@ Created automatically on first run. Edit it to change:
 | `CaddyPort` | `9110` | Port the reverse proxy listens on | ✅ Change if needed |
 | `CaddyAdminPort` | `2110` | Caddy admin API port | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
-| `MediaStoragePath` | `null` | Persistent backend image storage. Blank/null uses `<InstallRoot>\storage` and stores face images in `employee-faces\` | ✅ Set an absolute path, or a path relative to `InstallRoot` |
+| `MediaStoragePath` | `C:\ESS\storage` | Persistent backend image storage. Stores face images in `employee-faces\` under this path | ✅ Set an absolute path, or a path relative to `InstallRoot` |
 | `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `Ess_Face` for production, `Ess_Face_dev` for development |
 
 Production services use the `ess-face-*` prefix. Development services use
@@ -118,10 +118,10 @@ The script will:
    - **Backend** — clones repo, cleans stale untracked files, creates venv, `pip install`, generates `.env`, creates persistent image storage, and registers the API service
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
 
-Backend face profile images are stored outside the cloned backend repo so they survive redeploys. By default the folder is:
+Backend face profile images are stored outside the cloned backend repo and outside `Ess_Face`, so they survive reinstalling or deleting app service folders. By default the folder is:
 
 ```text
-<InstallRoot>\storage\employee-faces
+C:\ESS\storage\employee-faces
 ```
 
 Set `MediaStoragePath` in `deploy.config.json` if you want those images on another disk or folder.

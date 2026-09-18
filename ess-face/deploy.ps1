@@ -14,8 +14,8 @@
 #   deploy.config.json          - non-secret settings (install path, ports, repos)
 #   deploy.secrets.json         - DB/SMTP credentials (auto-added to .gitignore)
 #   deploy.secrets.example.json - template with placeholder values
-# Runtime folders created under InstallRoot by default:
-#   storage\employee-faces      - persistent face profile images
+# Runtime folders created by default:
+#   C:\ESS\storage\employee-faces - persistent face profile images
 # ===========================================================
 
 #Requires -RunAsAdministrator
@@ -64,7 +64,7 @@ $DefaultConfig = @{
     CaddyPort    = 9110
     CaddyAdminPort = 2110
     ApiPrefix    = "/api/v1"
-    MediaStoragePath = $null
+    MediaStoragePath = "C:\ESS\storage"
     InstallRoot  = $null
 }
 
@@ -504,7 +504,7 @@ function Get-MediaStoragePath {
         $configuredPath = "$($Config.MediaStoragePath)"
     }
     if ([string]::IsNullOrWhiteSpace($configuredPath)) {
-        return (Join-Path $Config.InstallRoot "storage")
+        return "C:\ESS\storage"
     }
     $expandedPath = [Environment]::ExpandEnvironmentVariables($configuredPath.Trim())
     if ([System.IO.Path]::IsPathRooted($expandedPath)) {
