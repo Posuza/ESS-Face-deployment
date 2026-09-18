@@ -2,4 +2,8 @@
 !ess-mo/
 !ess-mo/**
 !.gitattributes
+!.gitignore
 *.zip
+.DS_Store
+ess-mo/.DS_Store
+ess-mo/deploy.secrets.json
