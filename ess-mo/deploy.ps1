@@ -14,6 +14,8 @@
 #   deploy.config.json          - non-secret settings (install path, ports, repos)
 #   deploy.secrets.json         - DB/SMTP credentials (auto-added to .gitignore)
 #   deploy.secrets.example.json - template with placeholder values
+# Runtime folders created under InstallRoot by default:
+#   storage\employee-faces      - persistent face profile images
 # ===========================================================
 
 #Requires -RunAsAdministrator
@@ -65,6 +67,7 @@ $DefaultConfig = @{
     MoReportWorkerPollSeconds = 5
     MoReportRetentionMinutes  = 1
     MoReportSweepMinutes      = 0.1
+    MediaStoragePath = $null
     InstallRoot  = $null
 }
 
@@ -313,7 +316,8 @@ function Get-DeployConfig {
             'BackendPort',
             'MoReportWorkerPollSeconds',
             'MoReportRetentionMinutes',
-            'MoReportSweepMinutes'
+            'MoReportSweepMinutes',
+            'MediaStoragePath'
         ) | ForEach-Object {
             if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
                 Add-Member -InputObject $cfg -NotePropertyName $_ -NotePropertyValue $DefaultConfig[$_]
@@ -497,6 +501,40 @@ function Initialize-InstallRoot {
     New-Item -Path $Config.InstallRoot -ItemType Directory -Force | Out-Null
     New-Item -Path (Join-Path $Config.InstallRoot "logs") -ItemType Directory -Force | Out-Null
     Write-Log "Install root created at $($Config.InstallRoot)"
+}
+
+function Get-MediaStoragePath {
+    param($Config)
+    $configuredPath = $null
+    if ($Config | Get-Member -Name "MediaStoragePath" -ErrorAction SilentlyContinue) {
+        $configuredPath = "$($Config.MediaStoragePath)"
+    }
+    if ([string]::IsNullOrWhiteSpace($configuredPath)) {
+        return (Join-Path $Config.InstallRoot "storage")
+    }
+    $expandedPath = [Environment]::ExpandEnvironmentVariables($configuredPath.Trim())
+    if ([System.IO.Path]::IsPathRooted($expandedPath)) {
+        return $expandedPath
+    }
+    return (Join-Path $Config.InstallRoot $expandedPath)
+}
+
+function Convert-ToEnvPath {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    return ($Path -replace '\\', '/')
+}
+
+function Initialize-MediaStorage {
+    param($Config)
+    $mediaRoot = Get-MediaStoragePath -Config $Config
+    $facesDir = Join-Path $mediaRoot "employee-faces"
+    if ($script:dryRun) {
+        Write-Warn "[DRY-RUN] Would create media storage: $facesDir"
+        return $mediaRoot
+    }
+    New-Item -Path $facesDir -ItemType Directory -Force | Out-Null
+    Write-Log "Media storage ready: $mediaRoot"
+    return $mediaRoot
 }
 
 # ===========================================================
@@ -1067,6 +1105,8 @@ function Install-Frontend {
             if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
             git reset --hard "origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
             if ($LASTEXITCODE -ne 0) { throw "git reset failed with exit code $LASTEXITCODE" }
+            git clean -fd 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "git clean failed with exit code $LASTEXITCODE" }
             Pop-Location
         } else {
             Write-Host "    Cloning repo (first time)..." -ForegroundColor Gray
@@ -1505,6 +1545,7 @@ function Install-Backend {
             try {
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --depth 1 --prune origin "+refs/heads/$($Config.BackendBranch):refs/remotes/origin/$($Config.BackendBranch)" }
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git reset" -Command { git reset --hard "origin/$($Config.BackendBranch)" }
+                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git clean" -Command { git clean -fd }
             } finally {
                 Pop-Location
             }
@@ -1566,6 +1607,10 @@ function Install-Backend {
 
         # --- 4. Generate .env file before app import verification ---
         Write-Host "    Generating .env file..." -ForegroundColor Gray
+        $mediaStoragePath = Initialize-MediaStorage -Config $Config
+        $envMediaStoragePath = Convert-ToEnvPath -Path $mediaStoragePath
+        Write-Host "    Media storage: $mediaStoragePath" -ForegroundColor Gray
+        Write-FileLog -Path $installLog -Text "Media storage path: $mediaStoragePath"
         $rawKey = & $pythonExe -c "import secrets; print(secrets.token_hex(32))" 2>&1
         $generatedKey = ($rawKey | Select-Object -Last 1).Trim()
         if ([string]::IsNullOrWhiteSpace($generatedKey) -or $generatedKey.Length -lt 16) {
@@ -1600,6 +1645,8 @@ SMTP_PORT=587
 SMTP_USER="$envSmtpUser"
 SMTP_PASS="$envSmtpPass"
 EMAIL_FROM="$envSmtpFrom"
+
+MEDIA_STORAGE_PATH="$envMediaStoragePath"
 
 MO_REPORT_EXPORT_WORKER_POLL_SECONDS=$($Config.MoReportWorkerPollSeconds)
 MO_REPORT_EXPORT_RETENTION_MINUTES=$($Config.MoReportRetentionMinutes)

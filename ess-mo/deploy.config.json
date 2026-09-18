@@ -11,5 +11,6 @@
   "ApiPrefix": "/api/v1",
   "MoReportWorkerPollSeconds": 5,
   "MoReportRetentionMinutes": 1,
-  "MoReportSweepMinutes": 0.1
+  "MoReportSweepMinutes": 0.1,
+  "MediaStoragePath": null
 }

@@ -32,6 +32,7 @@ Created automatically on first run. Edit it to change:
 | `MoReportWorkerPollSeconds` | `5` | How often the worker checks for queued reports | ✅ Change if needed |
 | `MoReportRetentionMinutes` | `1` | How long completed report PDFs remain downloadable | ✅ Set the required number of minutes |
 | `MoReportSweepMinutes` | `0.1` | How often expired report files are removed (`0.1` = 6 seconds) | ✅ Change if needed |
+| `MediaStoragePath` | `null` | Persistent backend image storage. Blank/null uses `<InstallRoot>\storage` and stores face images in `employee-faces\` | ✅ Set an absolute path, or a path relative to `InstallRoot` |
 | `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `Ess_Mo` for production, `Ess_MO_dev` for development |
 
 Production services use the `ess-mo-*` prefix. Development services use
@@ -116,8 +117,16 @@ The script will:
 2. Ask for DB/SMTP credentials (if not pre-filled)
 3. Install each component:
    - **Frontend** — clones repo, `npm install`, builds, registers as Windows service
-   - **Backend** — clones repo, creates venv, `pip install`, generates `.env`, and registers both the API and environment-specific MO report worker services
+   - **Backend** — clones repo, cleans stale untracked files, creates venv, `pip install`, generates `.env`, creates persistent image storage, and registers both the API and environment-specific MO report worker services
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
+
+Backend face profile images are stored outside the cloned backend repo so they survive redeploys. By default the folder is:
+
+```text
+<InstallRoot>\storage\employee-faces
+```
+
+Set `MediaStoragePath` in `deploy.config.json` if you want those images on another disk or folder.
 4. Optionally start all services and verify health
 
 ---
