@@ -31,7 +31,7 @@ Created automatically on first run. Edit it to change:
 | `CaddyAdminPort` | `2110` | Caddy admin API port | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
 | `FrontendPublicUrl` | `null` | Public URL used in backend-generated links such as password reset emails. Blank/null uses `http://localhost:<CaddyPort>` | ✅ Set your LAN/DNS URL if users open the app from another computer |
-| `MediaStoragePath` | `null` | Persistent backend image storage. Blank/null uses `<drive>:\ESS\storage` and stores face images in `employee-faces\` | ✅ Set an absolute path, or a path relative to `<drive>:\ESS` |
+| `MediaStoragePath` | `null` | Persistent backend image storage. Blank/null uses `<drive>:\ESS\storage` and stores face images in `employee-faces\` | ✅ Set an absolute path, or a path relative to `<drive>:\ESS`. It can point to either a storage root or directly to an `employee-faces` folder |
 | `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `<drive>:\ESS\Ess_Face` for production, `<drive>:\ESS\Ess_Face_dev` for development |
 
 Production services use the `ess-face-*` prefix. Development services use
@@ -128,7 +128,7 @@ C:\ESS\storage\employee-faces
 
 The frontend does not read `C:\ESS\storage` directly. It requests images from the backend API (`/api/v1/faces/.../profile-image` and `/api/v1/admin/users/.../face-profile`), and the backend returns the JPEG from `MEDIA_STORAGE_PATH`. Caddy only needs the normal `/api/v1/* -> backend` route for images to show in the frontend.
 
-Set `MediaStoragePath` in `deploy.config.json` if you want those images in another folder. Relative paths are resolved from `C:\ESS`.
+Set `MediaStoragePath` in `deploy.config.json` if you want those images in another folder. Relative paths are resolved from `C:\ESS`. For example, both `D:\ESS\storage` and `D:\ESS\storage\employee-faces` are valid; the installer will create the needed folder if it does not exist.
 
 Uninstall removes only the selected app services and, if you confirm file deletion, the app folders under `C:\ESS\Ess_Face`. It never deletes `C:\ESS\storage`.
 4. Optionally start all services and verify health

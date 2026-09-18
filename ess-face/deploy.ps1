@@ -542,6 +542,14 @@ function Convert-ToEnvPath {
     return ($Path -replace '\\', '/')
 }
 
+function Get-FaceImagesDirectory {
+    param([Parameter(Mandatory=$true)][string]$MediaRoot)
+    if ((Split-Path -Path $MediaRoot -Leaf) -ieq "employee-faces") {
+        return $MediaRoot
+    }
+    return (Join-Path $MediaRoot "employee-faces")
+}
+
 function Get-FrontendPublicUrl {
     param($Config)
     if ($Config | Get-Member -Name "FrontendPublicUrl" -ErrorAction SilentlyContinue) {
@@ -556,13 +564,13 @@ function Get-FrontendPublicUrl {
 function Initialize-MediaStorage {
     param($Config)
     $mediaRoot = Get-MediaStoragePath -Config $Config
-    $facesDir = Join-Path $mediaRoot "employee-faces"
+    $facesDir = Get-FaceImagesDirectory -MediaRoot $mediaRoot
     if ($script:dryRun) {
         Write-Warn "[DRY-RUN] Would create media storage: $facesDir"
         return $mediaRoot
     }
     New-Item -Path $facesDir -ItemType Directory -Force | Out-Null
-    Write-Log "Media storage ready: $mediaRoot"
+    Write-Log "Media storage ready: $mediaRoot (face images: $facesDir)"
     return $mediaRoot
 }
 
