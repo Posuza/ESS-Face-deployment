@@ -128,7 +128,7 @@ C:\ESS\storage\employee-faces
 
 The frontend does not read `C:\ESS\storage` directly. It requests images from the backend API (`/api/v1/faces/.../profile-image` and `/api/v1/admin/users/.../face-profile`), and the backend returns the JPEG from `MEDIA_STORAGE_PATH`. Caddy only needs the normal `/api/v1/* -> backend` route for images to show in the frontend.
 
-Set `MediaStoragePath` in `deploy.config.json` if you want those images in another folder. Relative paths are resolved from `C:\ESS`. For example, both `D:\ESS\storage` and `D:\ESS\storage\employee-faces` are valid; the installer will create the needed folder if it does not exist.
+Set `MediaStoragePath` in `deploy.config.json` if you want those images in another folder. Relative paths are resolved from `C:\ESS`. For example, both `D:\ESS\storage` and `D:\ESS\storage\employee-faces` are valid; the installer will create the needed folder if it does not exist and verify that it is writable. Do not use macOS/Linux paths such as `/Users/...` on the Windows deployment server.
 
 Uninstall removes only the selected app services and, if you confirm file deletion, the app folders under `C:\ESS\Ess_Face`. It never deletes `C:\ESS\storage`.
 4. Optionally start all services and verify health

@@ -531,6 +531,9 @@ function Get-MediaStoragePath {
         return (Join-Path (Get-EssRootPath -Config $Config) "storage")
     }
     $expandedPath = [Environment]::ExpandEnvironmentVariables($configuredPath.Trim())
+    if ($expandedPath -match '^/') {
+        throw "MediaStoragePath '$configuredPath' looks like a macOS/Linux path. Use a Windows path like C:\ESS\storage, or a relative path from the ESS root."
+    }
     if ([System.IO.Path]::IsPathRooted($expandedPath)) {
         return $expandedPath
     }
@@ -570,7 +573,14 @@ function Initialize-MediaStorage {
         return $mediaRoot
     }
     New-Item -Path $facesDir -ItemType Directory -Force | Out-Null
-    Write-Log "Media storage ready: $mediaRoot (face images: $facesDir)"
+    $probeFile = Join-Path $facesDir ".deploy-write-test"
+    try {
+        "ok" | Set-Content -Path $probeFile -Encoding ASCII -Force -ErrorAction Stop
+        Remove-Item -Path $probeFile -Force -ErrorAction SilentlyContinue
+    } catch {
+        throw "Media storage is not writable: $facesDir. Check folder permissions or choose another MediaStoragePath. $_"
+    }
+    Write-Log "Media storage ready and writable: $mediaRoot (face images: $facesDir)"
     return $mediaRoot
 }
 
