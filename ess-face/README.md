@@ -126,6 +126,8 @@ C:\ESS\storage\employee-faces
 ```
 
 Set `MediaStoragePath` in `deploy.config.json` if you want those images in another folder. Relative paths are resolved from `C:\ESS`.
+
+Uninstall removes only the selected app services and, if you confirm file deletion, the app folders under `C:\ESS\Ess_Face`. It never deletes `C:\ESS\storage`.
 4. Optionally start all services and verify health
 
 ---

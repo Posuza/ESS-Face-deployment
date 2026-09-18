@@ -498,6 +498,18 @@ function Initialize-InstallRoot {
     Write-Log "Install root created at $($Config.InstallRoot)"
 }
 
+function Test-AppInstallRoot {
+    param($Config)
+    $installRoot = "$($Config.InstallRoot)"
+    if ([string]::IsNullOrWhiteSpace($installRoot)) {
+        return $false
+    }
+    $leaf = Split-Path -Path $installRoot -Leaf
+    $parent = Split-Path -Path $installRoot -Parent
+    $parentLeaf = Split-Path -Path $parent -Leaf
+    return ($leaf -eq (Get-InstallFolderName -Config $Config) -and $parentLeaf -eq "ESS")
+}
+
 function Get-EssRootPath {
     param($Config)
     $installRoot = "$($Config.InstallRoot)"
@@ -3149,23 +3161,25 @@ do {
                         foreach ($c in $compList) {
                             Remove-Component -Key $c.Key -Config $Config -DeleteFiles:$delFiles
                         }
-                        # Then ask about logs and root folder
-                        if ($delFiles -and (Confirm-Step "Delete logs/ folder and $($Config.InstallRoot) root folder too?" -DefaultYes:$false)) {
+                        # Then ask about logs and the app folder only. Persistent storage is outside InstallRoot.
+                        if ($delFiles -and (Confirm-Step "Delete logs/ folder and app folder $($Config.InstallRoot) too? Storage is preserved." -DefaultYes:$false)) {
                             $logsPath = Join-Path $Config.InstallRoot "logs"
                             if (Test-Path $logsPath) {
                                 Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
                                 Write-Success "Deleted logs/ folder"
                             }
-                            if ((Test-Path $Config.InstallRoot) -and ($Config.InstallRoot -match '\\[^\\]+$')) {
+                            if ((Test-Path $Config.InstallRoot) -and (Test-AppInstallRoot -Config $Config)) {
                                 # Only delete root if it's empty (after removing component + logs folders)
                                 $remaining = Get-ChildItem $Config.InstallRoot -ErrorAction SilentlyContinue
                                 if (-not $remaining) {
                                     Remove-Item $Config.InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
-                                    Write-Success "Deleted root folder: $($Config.InstallRoot)"
+                                    Write-Success "Deleted app folder: $($Config.InstallRoot)"
                                 } else {
-                                    Write-Warn "Root folder not empty, skipping: $($Config.InstallRoot)"
+                                    Write-Warn "App folder not empty, skipping: $($Config.InstallRoot)"
                                     Write-Host "    Remaining items: $($remaining.Name -join ', ')" -ForegroundColor Gray
                                 }
+                            } else {
+                                Write-Warn "InstallRoot does not look like an ESS app folder. Skipping folder delete: $($Config.InstallRoot)"
                             }
                         }
                     }
