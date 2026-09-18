@@ -1,6 +1,6 @@
 ﻿# ===========================================================
 # Servy Full-Stack Deployment Manager
-# Interactive CLI menu: install / uninstall / start / stop /
+# Interactive CLI menu: install / update / rollback / uninstall / start / stop /
 # status-check components, change install path, check prereqs.
 #
 # Usage:
@@ -57,9 +57,9 @@ $SecretsExamplePath = Join-Path $ScriptRoot "deploy.secrets.example.json"
 $DefaultConfig = @{
     Environment = "production"
     FrontendRepo = "https://github.com/Posuza/ESS-Face-Frontend.git"
-    FrontendBranch = "main"
+    FrontendBranch = "ver1"
     BackendRepo  = "https://github.com/Posuza/ESS-Face-Backend.git"
-    BackendBranch = "main"
+    BackendBranch = "ver1"
     FrontendPort = 3110
     BackendPort  = 8110
     CaddyPort    = 9110
@@ -582,6 +582,84 @@ function Initialize-MediaStorage {
     }
     Write-Log "Media storage ready and writable: $mediaRoot (face images: $facesDir)"
     return $mediaRoot
+}
+
+function Get-RollbackRoot {
+    param($Config)
+    return (Join-Path $Config.InstallRoot "rollback")
+}
+
+function Get-RollbackStatePath {
+    param($Config, [Parameter(Mandatory=$true)][string]$Key)
+    return (Join-Path (Get-RollbackRoot -Config $Config) "${Key}.json")
+}
+
+function Save-RollbackState {
+    param($Config, [Parameter(Mandatory=$true)][string]$Key, [Parameter(Mandatory=$true)]$State)
+    if ($script:dryRun) { return }
+    $rollbackRoot = Get-RollbackRoot -Config $Config
+    New-Item -Path $rollbackRoot -ItemType Directory -Force | Out-Null
+    $State | ConvertTo-Json -Depth 6 | Set-Content -Path (Get-RollbackStatePath -Config $Config -Key $Key) -Force -Encoding UTF8
+}
+
+function Get-RollbackState {
+    param($Config, [Parameter(Mandatory=$true)][string]$Key)
+    $path = Get-RollbackStatePath -Config $Config -Key $Key
+    if (-not (Test-Path $path)) { return $null }
+    try {
+        return Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json
+    } catch {
+        Write-Warn "Could not read rollback state: $path"
+        return $null
+    }
+}
+
+function Save-BackendRollbackPoint {
+    param($Config, [string]$LogPath = $null)
+    if ($script:dryRun) { return }
+    $repoDir = Join-Path (Join-Path $Config.InstallRoot "backend") "repo"
+    if (-not (Test-Path (Join-Path $repoDir ".git"))) { return }
+
+    $head = (& git -C $repoDir rev-parse HEAD 2>$null | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($head)) { return }
+    $branch = (& git -C $repoDir rev-parse --abbrev-ref HEAD 2>$null | Select-Object -First 1)
+    $state = [PSCustomObject]@{
+        Key = "backend"
+        SavedAt = (Get-Date).ToString("o")
+        RepoDir = $repoDir
+        Commit = "$head"
+        Branch = "$branch"
+    }
+    Save-RollbackState -Config $Config -Key "backend" -State $state
+    if ($LogPath) { Write-FileLog -Path $LogPath -Text "Backend rollback point saved: $head" }
+}
+
+function Save-CaddyRollbackPoint {
+    param($Config, [string]$LogPath = $null)
+    if ($script:dryRun) { return }
+    $caddyDir = Join-Path $Config.InstallRoot "caddy"
+    if (-not (Test-Path $caddyDir)) { return }
+
+    $filesToBackup = @("Caddyfile", "caddy-run.ps1")
+    $existingFiles = @($filesToBackup | Where-Object { Test-Path (Join-Path $caddyDir $_) })
+    if ($existingFiles.Count -eq 0) { return }
+
+    $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
+    $backupDir = Join-Path (Get-RollbackRoot -Config $Config) "caddy-$ts"
+    New-Item -Path $backupDir -ItemType Directory -Force | Out-Null
+    foreach ($file in $existingFiles) {
+        Copy-Item -Path (Join-Path $caddyDir $file) -Destination (Join-Path $backupDir $file) -Force
+    }
+
+    $state = [PSCustomObject]@{
+        Key = "caddy"
+        SavedAt = (Get-Date).ToString("o")
+        CaddyDir = $caddyDir
+        BackupDir = $backupDir
+        Files = $existingFiles
+    }
+    Save-RollbackState -Config $Config -Key "caddy" -State $state
+    if ($LogPath) { Write-FileLog -Path $LogPath -Text "Caddy rollback point saved: $backupDir" }
 }
 
 # ===========================================================
@@ -1573,6 +1651,7 @@ function Install-Backend {
         Write-FileLog -Path $installLog -Text "Branch: $($Config.BackendBranch)"
         Write-FileLog -Path $installLog -Text "RepoDir: $repoDir"
         Write-FileLog -Path $installLog -Text "Port: $appPort"
+        Save-BackendRollbackPoint -Config $Config -LogPath $installLog
 
         # --- 0. Stop/uninstall API service before touching repo/venv ---
         Stop-BackendRuntime -ServiceNames @($svcName) -AppDir $appDir -RepoDir $repoDir -LogPath $installLog
@@ -1927,6 +2006,7 @@ function Install-Caddy {
         $caddyDir = Join-Path $Config.InstallRoot "caddy"
         New-Item -Path $caddyDir -ItemType Directory -Force | Out-Null
         $caddyExe = Join-Path $caddyDir "caddy.exe"
+        Save-CaddyRollbackPoint -Config $Config -LogPath $caddyInstallLog
 
         if (-not (Test-Path $caddyExe)) {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -2348,7 +2428,171 @@ function Invoke-RollbackApp {
     New-Item -ItemType SymbolicLink -Path $curLink -Target $targetRelease.FullName -Force | Out-Null
     Write-Success "Rolled back $AppName to release: $($targetRelease.Name)"
     Write-Log "$AppName rolled back to release: $($targetRelease.Name)"
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($svc) {
+        Restart-Service -Name $svcName -ErrorAction SilentlyContinue
+        Write-Success "Restarted service: $svcName"
+    }
     return $true
+}
+
+function Invoke-BackendRollback {
+    param($Config)
+    Write-Step "Rolling back backend"
+
+    $state = Get-RollbackState -Config $Config -Key "backend"
+    if (-not $state -or [string]::IsNullOrWhiteSpace("$($state.Commit)")) {
+        Write-Warn "No backend rollback point found. Run at least one backend update first."
+        return $false
+    }
+
+    $repoDir = "$($state.RepoDir)"
+    if (-not (Test-Path (Join-Path $repoDir ".git"))) {
+        Write-Warn "Backend repo not found: $repoDir"
+        return $false
+    }
+
+    if ($script:dryRun) {
+        Write-Warn "[DRY-RUN] Would reset backend repo to $($state.Commit), refresh requirements, restart service, and verify health."
+        return $true
+    }
+
+    $svcName = Get-DeployServiceName -Config $Config -Component "backend"
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+
+    try {
+        if ($svc -and $svc.Status -ne 'Stopped') {
+            Write-Host "    Stopping backend service..." -ForegroundColor Gray
+            Stop-Service -Name $svcName -ErrorAction Stop
+            Start-Sleep -Seconds 3
+        }
+
+        Write-Host "    Restoring backend commit $($state.Commit)..." -ForegroundColor Gray
+        & git -C $repoDir reset --hard "$($state.Commit)"
+        if ($LASTEXITCODE -ne 0) {
+            throw "git reset failed with exit code $LASTEXITCODE"
+        }
+
+        # Keep the existing .env/secrets, but make the Python environment compatible
+        # with the restored commit in case requirements.txt changed.
+        $pythonExe = Join-Path $repoDir "venv\Scripts\python.exe"
+        $requirements = Join-Path $repoDir "requirements.txt"
+        if ((Test-Path $pythonExe) -and (Test-Path $requirements)) {
+            Write-Host "    Synchronizing backend dependencies for restored commit..." -ForegroundColor Gray
+            & $pythonExe -m pip install --no-cache-dir -r $requirements
+            if ($LASTEXITCODE -ne 0) {
+                throw "pip install for rollback requirements failed with exit code $LASTEXITCODE"
+            }
+        } else {
+            Write-Warn "Backend venv or requirements.txt is missing. Code was restored, but dependencies were not refreshed."
+        }
+
+        if ($svc) {
+            Write-Host "    Starting backend service..." -ForegroundColor Gray
+            Start-Service -Name $svcName -ErrorAction Stop
+            Start-Sleep -Seconds 3
+
+            $healthOk = Test-Endpoint `
+                -Url "http://127.0.0.1:$($Config.BackendPort)$($Config.ApiPrefix)/health" `
+                -Name "Backend API" `
+                -TimeoutSec 5 `
+                -Retries 5 `
+                -RetryDelaySec 2
+
+            if (-not $healthOk) {
+                throw "Backend rollback completed, but health verification failed."
+            }
+        }
+
+        Write-Success "Backend rolled back to commit: $($state.Commit)"
+        Write-Log "Backend rollback completed: $($state.Commit)"
+        return $true
+    }
+    catch {
+        Write-Err "Backend rollback failed: $_"
+        Write-Log "Backend rollback failed: $_" -Level "ERROR"
+        return $false
+    }
+}
+
+function Invoke-CaddyRollback {
+    param($Config)
+    Write-Step "Rolling back Caddy"
+    $state = Get-RollbackState -Config $Config -Key "caddy"
+    if (-not $state -or [string]::IsNullOrWhiteSpace("$($state.BackupDir)")) {
+        Write-Warn "No Caddy rollback point found. Run at least one Caddy update first."
+        return $false
+    }
+    if (-not (Test-Path "$($state.BackupDir)")) {
+        Write-Warn "Caddy rollback backup not found: $($state.BackupDir)"
+        return $false
+    }
+    if ($script:dryRun) {
+        Write-Warn "[DRY-RUN] Would restore Caddy config from $($state.BackupDir)"
+        return $true
+    }
+
+    $svcName = Get-DeployServiceName -Config $Config -Component "caddy"
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Stopped') {
+        Stop-Service -Name $svcName -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+    }
+
+    foreach ($file in @($state.Files)) {
+        Copy-Item -Path (Join-Path "$($state.BackupDir)" "$file") -Destination (Join-Path "$($state.CaddyDir)" "$file") -Force
+    }
+
+    if ($svc) {
+        Start-Service -Name $svcName -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+    }
+    Write-Success "Caddy config rolled back from: $($state.BackupDir)"
+    return $true
+}
+
+function Invoke-SelectedRollback {
+    param($Config, [Parameter(Mandatory=$true)][string]$Key)
+    switch ($Key) {
+        "frontend" { return Invoke-RollbackApp -Config $Config -AppName "frontend" }
+        "backend"  { return Invoke-BackendRollback -Config $Config }
+        "caddy"    { return Invoke-CaddyRollback -Config $Config }
+        default    { Write-Warn "Unknown rollback component: $Key"; return $false }
+    }
+}
+
+function Show-RollbackMenu {
+    param($Config)
+    Write-Host ""
+    Write-Host " A) Rollback everything" -ForegroundColor White
+    foreach ($c in Get-Components -Config $Config) {
+        Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Gray
+    }
+    Write-Host " H) Frontend release history" -ForegroundColor Gray
+    Write-Host " B) Back" -ForegroundColor Gray
+    $sub = Read-Host "`nSelect rollback option"
+
+    if ($sub -match '^[Aa]$') {
+        if (Confirm-Step "Rollback all components?" -DefaultYes:$false) {
+            $ok = $true
+            foreach ($key in @("frontend", "backend", "caddy")) {
+                if (-not (Invoke-SelectedRollback -Config $Config -Key $key)) { $ok = $false }
+            }
+            if ($ok) {
+                Verify-Health -Config $Config | Out-Null
+                Write-Success "Rollback all completed."
+            } else {
+                Write-Warn "Rollback all finished with warnings. Check messages above."
+            }
+        }
+    } elseif ($sub -match '^[Hh]$') {
+        Show-ReleaseHistory -Config $Config -AppName "frontend"
+    } elseif ($sub -match '^\d+$') {
+        $c = Get-Components -Config $Config | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
+        if ($c -and (Confirm-Step "Rollback $($c.Display)?" -DefaultYes:$false)) {
+            Invoke-SelectedRollback -Config $Config -Key $c.Key | Out-Null
+        }
+    }
 }
 
 # ===========================================================
@@ -2800,6 +3044,7 @@ function Show-MainMenu {
     Write-Host "  6) Stop services" -ForegroundColor White
     Write-Host "  7) Caddy network config" -ForegroundColor White
     Write-Host "  8) Open logs folder" -ForegroundColor White
+    Write-Host "  9) Rollback deployment" -ForegroundColor White
     Write-Host "  Q) Quit" -ForegroundColor White
     Write-Host ""
 }
@@ -3339,6 +3584,11 @@ do {
             # Open logs folder
             $logsPath = Join-Path $Config.InstallRoot "logs"
             if (Test-Path $logsPath) { Invoke-Item $logsPath } else { Write-Warn "No logs folder yet." }
+        }
+        "^9$" {
+            # Rollback all or an individual component
+            Initialize-Logger -Config $Config
+            Show-RollbackMenu -Config $Config
         }
         "^[Qq]$" { Write-Host "`nBye." -ForegroundColor Cyan }
         default  { Write-Warn "Unknown option." }
