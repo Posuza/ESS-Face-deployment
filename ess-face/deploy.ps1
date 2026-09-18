@@ -15,7 +15,8 @@
 #   deploy.secrets.json         - DB/SMTP credentials (auto-added to .gitignore)
 #   deploy.secrets.example.json - template with placeholder values
 # Runtime folders created by default:
-#   C:\ESS\storage\employee-faces - persistent face profile images
+#   <drive>:\ESS\Ess_Face              - app services and runtime
+#   <drive>:\ESS\storage\employee-faces - persistent face profile images
 # ===========================================================
 
 #Requires -RunAsAdministrator
@@ -64,7 +65,7 @@ $DefaultConfig = @{
     CaddyPort    = 9110
     CaddyAdminPort = 2110
     ApiPrefix    = "/api/v1"
-    MediaStoragePath = "C:\ESS\storage"
+    MediaStoragePath = $null
     InstallRoot  = $null
 }
 
@@ -366,7 +367,7 @@ function Select-InstallDrive {
             Write-Log "Configured drive $drive not found among available drives" -Level "ERROR"
             return $null
         }
-        $newRoot = "$driveLetter`:\$installFolder"
+        $newRoot = "$driveLetter`:\ESS\$installFolder"
         if ($Config.InstallRoot -ne $newRoot) {
             $Config.InstallRoot = $newRoot
             Save-DeployConfig -Config $Config
@@ -414,7 +415,7 @@ function Select-InstallDrive {
         $valid = $true
     } while (-not $valid)
 
-    $newRoot = "$choice`:\$installFolder"
+    $newRoot = "$choice`:\ESS\$installFolder"
 
     if (-not $hasCurrent -or $newRoot -ne $Config.InstallRoot) {
         $Config.InstallRoot = $newRoot
@@ -497,6 +498,15 @@ function Initialize-InstallRoot {
     Write-Log "Install root created at $($Config.InstallRoot)"
 }
 
+function Get-EssRootPath {
+    param($Config)
+    $installRoot = "$($Config.InstallRoot)"
+    if ([string]::IsNullOrWhiteSpace($installRoot)) {
+        return "C:\ESS"
+    }
+    return (Split-Path -Path $installRoot -Parent)
+}
+
 function Get-MediaStoragePath {
     param($Config)
     $configuredPath = $null
@@ -504,13 +514,13 @@ function Get-MediaStoragePath {
         $configuredPath = "$($Config.MediaStoragePath)"
     }
     if ([string]::IsNullOrWhiteSpace($configuredPath)) {
-        return "C:\ESS\storage"
+        return (Join-Path (Get-EssRootPath -Config $Config) "storage")
     }
     $expandedPath = [Environment]::ExpandEnvironmentVariables($configuredPath.Trim())
     if ([System.IO.Path]::IsPathRooted($expandedPath)) {
         return $expandedPath
     }
-    return (Join-Path $Config.InstallRoot $expandedPath)
+    return (Join-Path (Get-EssRootPath -Config $Config) $expandedPath)
 }
 
 function Convert-ToEnvPath {

@@ -30,8 +30,8 @@ Created automatically on first run. Edit it to change:
 | `CaddyPort` | `9110` | Port the reverse proxy listens on | ✅ Change if needed |
 | `CaddyAdminPort` | `2110` | Caddy admin API port | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
-| `MediaStoragePath` | `C:\ESS\storage` | Persistent backend image storage. Stores face images in `employee-faces\` under this path | ✅ Set an absolute path, or a path relative to `InstallRoot` |
-| `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `Ess_Face` for production, `Ess_Face_dev` for development |
+| `MediaStoragePath` | `null` | Persistent backend image storage. Blank/null uses `<drive>:\ESS\storage` and stores face images in `employee-faces\` | ✅ Set an absolute path, or a path relative to `<drive>:\ESS` |
+| `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `<drive>:\ESS\Ess_Face` for production, `<drive>:\ESS\Ess_Face_dev` for development |
 
 Production services use the `ess-face-*` prefix. Development services use
 `ess-face-dev-*`, allowing both environments to run on the same machine when
@@ -88,7 +88,7 @@ powershell -ExecutionPolicy Bypass -File "filepath\deploy.ps1"
 
 ### 3. Set install location (first run only)
 
-You'll be asked to pick a **drive** (e.g. `C:`, `D:`). The script creates an `Ess_Face` folder there (`C:\Ess_Face`).
+You'll be asked to pick a **drive** (e.g. `C:`, `D:`). The script creates an `ESS` folder there if needed, then creates the app folder inside it (`C:\ESS\Ess_Face`).
 
 ### 4. Use the main menu
 
@@ -118,13 +118,14 @@ The script will:
    - **Backend** — clones repo, cleans stale untracked files, creates venv, `pip install`, generates `.env`, creates persistent image storage, and registers the API service
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
 
-Backend face profile images are stored outside the cloned backend repo and outside `Ess_Face`, so they survive reinstalling or deleting app service folders. By default the folder is:
+Backend face profile images are stored outside the cloned backend repo and outside `Ess_Face`, so they survive reinstalling or deleting app service folders. By default the folders are:
 
 ```text
+C:\ESS\Ess_Face
 C:\ESS\storage\employee-faces
 ```
 
-Set `MediaStoragePath` in `deploy.config.json` if you want those images on another disk or folder.
+Set `MediaStoragePath` in `deploy.config.json` if you want those images in another folder. Relative paths are resolved from `C:\ESS`.
 4. Optionally start all services and verify health
 
 ---

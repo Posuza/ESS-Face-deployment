@@ -9,5 +9,5 @@
   "CaddyPort": 9110,
   "CaddyAdminPort": 2110,
   "ApiPrefix": "/api/v1",
-  "MediaStoragePath": "C:\\ESS\\storage"
+  "MediaStoragePath": null
 }
