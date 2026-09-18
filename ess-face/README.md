@@ -12,7 +12,7 @@ Edit these **before** your first deploy if your setup differs from the defaults.
 
 ### `deploy.config.json` — settings (ports, paths, repos)
 
-### `deploy.secrtes.json` — settings (credentials)
+### `deploy.secrets.json` — settings (credentials)
 
 Created automatically on first run. Edit it to change:
 
@@ -30,6 +30,7 @@ Created automatically on first run. Edit it to change:
 | `CaddyPort` | `9110` | Port the reverse proxy listens on | ✅ Change if needed |
 | `CaddyAdminPort` | `2110` | Caddy admin API port | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
+| `FrontendPublicUrl` | `null` | Public URL used in backend-generated links such as password reset emails. Blank/null uses `http://localhost:<CaddyPort>` | ✅ Set your LAN/DNS URL if users open the app from another computer |
 | `MediaStoragePath` | `null` | Persistent backend image storage. Blank/null uses `<drive>:\ESS\storage` and stores face images in `employee-faces\` | ✅ Set an absolute path, or a path relative to `<drive>:\ESS` |
 | `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `<drive>:\ESS\Ess_Face` for production, `<drive>:\ESS\Ess_Face_dev` for development |
 
@@ -66,7 +67,7 @@ You can either:
 - **Pre-fill** `deploy.secrets.json` with your real values (copy from `deploy.secrets.example.json`)
 - **Or let the script prompt you** — it will ask for credentials at the start of the deployment
 
-> The script never blocks — if you skip entering credentials, it uses defaults that you can update later.
+> If credentials are missing or still contain placeholders, the backend deployment stops so you can fill `deploy.secrets.json` first.
 
 ### 2. Run the script
 
@@ -125,6 +126,8 @@ C:\ESS\Ess_Face
 C:\ESS\storage\employee-faces
 ```
 
+The frontend does not read `C:\ESS\storage` directly. It requests images from the backend API (`/api/v1/faces/.../profile-image` and `/api/v1/admin/users/.../face-profile`), and the backend returns the JPEG from `MEDIA_STORAGE_PATH`. Caddy only needs the normal `/api/v1/* -> backend` route for images to show in the frontend.
+
 Set `MediaStoragePath` in `deploy.config.json` if you want those images in another folder. Relative paths are resolved from `C:\ESS`.
 
 Uninstall removes only the selected app services and, if you confirm file deletion, the app folders under `C:\ESS\Ess_Face`. It never deletes `C:\ESS\storage`.
@@ -136,7 +139,7 @@ Uninstall removes only the selected app services and, if you confirm file deleti
 Use **option 7** to manage which services Caddy proxies to:
 
 ```
- Caddy listener : 127.0.0.1:8089
+ Caddy listener : 127.0.0.1:9110
 
  Available targets:
    (all targets already registered)

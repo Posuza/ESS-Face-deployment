@@ -65,6 +65,7 @@ $DefaultConfig = @{
     CaddyPort    = 9110
     CaddyAdminPort = 2110
     ApiPrefix    = "/api/v1"
+    FrontendPublicUrl = $null
     MediaStoragePath = $null
     InstallRoot  = $null
 }
@@ -312,6 +313,7 @@ function Get-DeployConfig {
             'CaddyAdminPort',
             'FrontendPort',
             'BackendPort',
+            'FrontendPublicUrl',
             'MediaStoragePath'
         ) | ForEach-Object {
             if (-not ($cfg | Get-Member -Name $_ -ErrorAction SilentlyContinue)) {
@@ -538,6 +540,17 @@ function Get-MediaStoragePath {
 function Convert-ToEnvPath {
     param([Parameter(Mandatory=$true)][string]$Path)
     return ($Path -replace '\\', '/')
+}
+
+function Get-FrontendPublicUrl {
+    param($Config)
+    if ($Config | Get-Member -Name "FrontendPublicUrl" -ErrorAction SilentlyContinue) {
+        $configuredUrl = "$($Config.FrontendPublicUrl)"
+        if (-not [string]::IsNullOrWhiteSpace($configuredUrl)) {
+            return $configuredUrl.Trim().TrimEnd('/')
+        }
+    }
+    return "http://localhost:$($Config.CaddyPort)"
 }
 
 function Initialize-MediaStorage {
@@ -1632,14 +1645,18 @@ function Install-Backend {
         $envDbPass   = $Secrets.db.password.Replace('\', '\\').Replace('"', '\"')
         $envDbHost   = $Secrets.db.host.Replace('\', '\\').Replace('"', '\"')
         $envDbName   = $Secrets.db.name.Replace('\', '\\').Replace('"', '\"')
+        $envDbPort   = [int]$Secrets.db.port
+        $envSmtpHost = $Secrets.smtp.host.Replace('\', '\\').Replace('"', '\"')
+        $envSmtpPort = [int]$Secrets.smtp.port
         $envSmtpUser = $Secrets.smtp.user.Replace('\', '\\').Replace('"', '\"')
         $envSmtpPass = $Secrets.smtp.pass.Replace('\', '\\').Replace('"', '\"')
         $envSmtpFrom = $Secrets.smtp.from.Replace('\', '\\').Replace('"', '\"')
+        $envFrontendUrl = (Get-FrontendPublicUrl -Config $Config).Replace('\', '\\').Replace('"', '\"')
 
         $envContent = @"
 DB_ENGINE=mysql
 DB_HOST=$envDbHost
-DB_PORT=3306
+DB_PORT=$envDbPort
 DB_USER="$envDbUser"
 DB_PASSWORD="$envDbPass"
 DB_NAME=$envDbName
@@ -1648,11 +1665,14 @@ SECRET_KEY=$generatedKey
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
+SMTP_HOST=$envSmtpHost
+SMTP_PORT=$envSmtpPort
 SMTP_USER="$envSmtpUser"
 SMTP_PASS="$envSmtpPass"
 EMAIL_FROM="$envSmtpFrom"
+FRONTEND_URL="$envFrontendUrl"
+RESET_EXPIRE_MINUTES=15
+MFA_ISSUER_NAME="ESS Face"
 
 MEDIA_STORAGE_PATH="$envMediaStoragePath"
 "@

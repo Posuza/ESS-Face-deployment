@@ -9,5 +9,6 @@
   "CaddyPort": 9110,
   "CaddyAdminPort": 2110,
   "ApiPrefix": "/api/v1",
+  "FrontendPublicUrl": null,
   "MediaStoragePath": null
 }
