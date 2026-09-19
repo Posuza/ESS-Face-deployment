@@ -1,4 +1,4 @@
-﻿# ===========================================================
+# ===========================================================
 # Servy Full-Stack Deployment Manager
 # Interactive CLI menu: install / update / rollback / uninstall / start / stop /
 # status-check components, change install path, check prereqs.
@@ -976,6 +976,38 @@ function Get-OrCreateSecrets {
 # ===========================================================
 # PREREQUISITES
 # ===========================================================
+function Test-VCRedistX64Installed {
+    # Primary check: Microsoft VC++ Runtime registry registration.
+    $registryPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+    )
+
+    foreach ($path in $registryPaths) {
+        try {
+            $runtime = Get-ItemProperty -Path $path -ErrorAction Stop
+            if ($runtime.Installed -eq 1) {
+                return $true
+            }
+        } catch { }
+    }
+
+    # Fallback check for the native DLLs ONNX Runtime needs on Windows.
+    $requiredDlls = @(
+        "$env:WINDIR\System32\vcruntime140.dll",
+        "$env:WINDIR\System32\vcruntime140_1.dll",
+        "$env:WINDIR\System32\msvcp140.dll"
+    )
+
+    foreach ($dll in $requiredDlls) {
+        if (-not (Test-Path $dll)) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Test-Prerequisites {
     param([switch]$CheckOnly)
     Write-Step "Checking prerequisites"
@@ -996,6 +1028,20 @@ function Test-Prerequisites {
         } else {
             Write-Host "    $($tool.Name): MISSING" -ForegroundColor Red
             $missing += $tool
+        }
+    }
+
+    # Microsoft Visual C++ Redistributable x64 check.
+    # ONNX Runtime native Windows DLLs require this runtime.
+    if (Test-VCRedistX64Installed) {
+        Write-Host "    Microsoft Visual C++ Redistributable x64: OK" -ForegroundColor Green
+    } else {
+        Write-Host "    Microsoft Visual C++ Redistributable x64: MISSING" -ForegroundColor Red
+        $missing += @{
+            Cmd = "__vcredist_x64__"
+            Name = "Microsoft Visual C++ Redistributable x64"
+            WingetId = "Microsoft.VCRedist.2015+.x64"
+            Url = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
         }
     }
 
@@ -1025,20 +1071,39 @@ function Test-Prerequisites {
             foreach ($tool in $missing) {
                 Write-Host "    Installing $($tool.Name)..." -ForegroundColor Gray
                 Write-Log "Installing $($tool.Name) via winget ($($tool.WingetId))"
+
+                if ($tool.Cmd -eq "__vcredist_x64__") {
+                    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+                        Write-Err "    Winget is required to install Microsoft Visual C++ Redistributable automatically."
+                        Write-Host "    Install manually: $($tool.Url)" -ForegroundColor Gray
+                        $allSucceeded = $false
+                        continue
+                    }
+
+                    winget install --id $tool.WingetId --exact --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+
+                    if (Test-VCRedistX64Installed) {
+                        Write-Success "    $($tool.Name): installed"
+                        Write-Log "$($tool.Name) verified after installation"
+                    } else {
+                        Write-Err "    $($tool.Name) installation/verification failed."
+                        Write-Host "    Install manually: $($tool.Url)" -ForegroundColor Gray
+                        $allSucceeded = $false
+                    }
+                    continue
+                }
+
                 if ($tool.WingetId -and (Get-Command winget -ErrorAction SilentlyContinue)) {
                     winget install $tool.WingetId --accept-package-agreements --silent 2>&1 | Out-Null
                 }
-                # Try downloading for servy if winget didn't work
+
+                # Refresh PATH and verify command-based prerequisites.
+                $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+
                 if (-not (Get-Command $tool.Cmd -ErrorAction SilentlyContinue)) {
-                    # Refresh PATH
-                    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
-                    if (-not (Get-Command $tool.Cmd -ErrorAction SilentlyContinue)) {
-                        Write-Err "    $($tool.Name) install may have failed."
-                        Write-Host "    Install manually: $($tool.Url)" -ForegroundColor Gray
-                        $allSucceeded = $false
-                    } else {
-                        Write-Success "    $($tool.Name): installed"
-                    }
+                    Write-Err "    $($tool.Name) install may have failed."
+                    Write-Host "    Install manually: $($tool.Url)" -ForegroundColor Gray
+                    $allSucceeded = $false
                 } else {
                     Write-Success "    $($tool.Name): installed"
                 }
@@ -1235,10 +1300,10 @@ function Install-Frontend {
         # --- 2. npm install ---
         Write-Host "    Installing dependencies..." -ForegroundColor Gray
         Push-Location $repoDir
-        npm install 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "npm install failed with exit code $LASTEXITCODE" }
-        npm install serve 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "npm install serve failed with exit code $LASTEXITCODE" }
+        npm install --legacy-peer-deps 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "npm install --legacy-peer-deps failed with exit code $LASTEXITCODE" }
+        npm install --no-save serve --legacy-peer-deps 2>&1 | Add-FileLog -Path $installLog
+        if ($LASTEXITCODE -ne 0) { throw "npm install serve --legacy-peer-deps failed with exit code $LASTEXITCODE" }
 
         # --- 3. Build ---
         Write-Host "    Building..." -ForegroundColor Gray
@@ -1494,6 +1559,12 @@ function Install-Backend {
     Initialize-InstallRoot -Config $Config
     Write-Step "Installing / Updating Backend"
 
+    if (-not (Test-VCRedistX64Installed)) {
+        Write-Err "Microsoft Visual C++ Redistributable x64 is missing. Run prerequisite check/install first."
+        Write-Log "Backend install blocked: Microsoft Visual C++ Redistributable x64 missing" -Level "ERROR"
+        return $false
+    }
+
     if ($script:dryRun) {
         Write-Warn "[DRY-RUN] Would install Backend from $($Config.BackendRepo), branch $($Config.BackendBranch), on port $($Config.BackendPort)"
         return $true
@@ -1613,31 +1684,111 @@ function Install-Backend {
     function Get-BackendPythonCreator {
         param([Parameter(Mandatory=$true)][string]$LogPath)
 
+        # The face backend uses native ONNX Runtime wheels. Keep production on
+        # Python 3.13 where native Windows dependencies are more predictable.
+        # Do not silently pick a newer generic "py -3" interpreter such as 3.14.
+        $preferredVersions = @("3.13", "3.12", "3.11")
+
         $py = Get-Command py -ErrorAction SilentlyContinue
-        if ($py) {
-            $check311 = & py -3.11 -c "import sys; print(sys.version)" 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-FileLog -Path $LogPath -Text "Using Python launcher: py -3.11 ($check311)"
-                return @{ File = "py"; Args = @("-3.11") }
-            }
 
-            $check3 = & py -3 -c "import sys; print(sys.version)" 2>&1
+        function Test-PythonLauncherVersion {
+            param([string]$Version)
+            if (-not $py) { return $null }
+
+            $check = & py "-$Version" -c "import sys; print(sys.version); print(sys.executable)" 2>&1
             if ($LASTEXITCODE -eq 0) {
-                Write-FileLog -Path $LogPath -Text "Using Python launcher: py -3 ($check3)"
-                return @{ File = "py"; Args = @("-3") }
+                Write-FileLog -Path $LogPath -Text "Using Python launcher: py -$Version ($($check -join ' | '))"
+                return @{ File = "py"; Args = @("-$Version"); Version = $Version }
             }
+            return $null
         }
 
-        $python = Get-Command python -ErrorAction SilentlyContinue
-        if ($python) {
-            $checkPython = & $python.Source -c "import sys; print(sys.version)" 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-FileLog -Path $LogPath -Text "Using python executable: $($python.Source) ($checkPython)"
-                return @{ File = $python.Source; Args = @() }
-            }
+        foreach ($version in $preferredVersions) {
+            $candidate = Test-PythonLauncherVersion -Version $version
+            if ($candidate) { return $candidate }
         }
 
-        throw "No usable Python interpreter found. Install Python 3.11+ and ensure 'py' or 'python' is in PATH."
+        # If Python 3.13 is not installed, try to install it automatically.
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Write-Host "    Python 3.13 not found. Installing Python 3.13 for backend compatibility..." -ForegroundColor Yellow
+            Write-FileLog -Path $LogPath -Text "Python 3.13 not found; attempting winget install Python.Python.3.13"
+
+            winget install --id Python.Python.3.13 --exact --silent --accept-package-agreements --accept-source-agreements 2>&1 |
+                Add-FileLog -Path $LogPath
+
+            $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+                        [Environment]::GetEnvironmentVariable("Path", "User")
+
+            $py = Get-Command py -ErrorAction SilentlyContinue
+            $candidate = Test-PythonLauncherVersion -Version "3.13"
+            if ($candidate) { return $candidate }
+        }
+
+        throw "Python 3.13, 3.12, or 3.11 is required for the backend. Python 3.14 is intentionally not selected for this ONNX Runtime deployment."
+    }
+
+    function Repair-OnnxWindowsRuntime {
+        param(
+            [Parameter(Mandatory=$true)][string]$PythonExe,
+            [Parameter(Mandatory=$true)][string]$LogPath
+        )
+
+        Write-FileLog -Path $LogPath -Text "--- ONNX Runtime native import check ---"
+        $ortCheck = @(& $PythonExe -c "import onnxruntime as ort; print('ORT_OK'); print(ort.__version__)" 2>&1)
+        $ortExit = $LASTEXITCODE
+        foreach ($line in $ortCheck) {
+            Write-Host "$line"
+            Write-FileLog -Path $LogPath -Text "$line"
+        }
+
+        if ($ortExit -eq 0 -and (($ortCheck -join " | ") -match "ORT_OK")) {
+            Write-FileLog -Path $LogPath -Text "ONNX Runtime native import check passed"
+            return
+        }
+
+        $detail = $ortCheck -join " | "
+        Write-Warn "ONNX Runtime native import failed. Installing/updating Microsoft Visual C++ x64 runtime..."
+        Write-FileLog -Path $LogPath -Text "ONNX Runtime import failed before VC++ repair: $detail"
+
+        $redistPath = Join-Path $env:TEMP "vc_redist.x64.exe"
+        try {
+            Invoke-WebRequest `
+                -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" `
+                -OutFile $redistPath `
+                -UseBasicParsing `
+                -ErrorAction Stop
+
+            $proc = Start-Process `
+                -FilePath $redistPath `
+                -ArgumentList @("/install", "/quiet", "/norestart") `
+                -Wait `
+                -PassThru
+
+            # 0 = success, 1638 = another/newer version installed, 3010 = success/reboot required.
+            if ($proc.ExitCode -notin @(0, 1638, 3010)) {
+                throw "Visual C++ Redistributable installer exited with code $($proc.ExitCode)"
+            }
+
+            Write-FileLog -Path $LogPath -Text "VC++ x64 runtime install/repair exit code: $($proc.ExitCode)"
+        }
+        finally {
+            Remove-Item $redistPath -Force -ErrorAction SilentlyContinue
+        }
+
+        # Retry the exact native import after the runtime repair.
+        $ortRetry = @(& $PythonExe -c "import onnxruntime as ort; print('ORT_OK'); print(ort.__version__)" 2>&1)
+        $ortRetryExit = $LASTEXITCODE
+        foreach ($line in $ortRetry) {
+            Write-Host "$line"
+            Write-FileLog -Path $LogPath -Text "$line"
+        }
+
+        if ($ortRetryExit -ne 0 -or (($ortRetry -join " | ") -notmatch "ORT_OK")) {
+            throw "ONNX Runtime still cannot load after installing the Microsoft Visual C++ x64 runtime. Detail: $($ortRetry -join ' | ')"
+        }
+
+        Write-Success "ONNX Runtime native import passed"
+        Write-FileLog -Path $LogPath -Text "ONNX Runtime native import passed after VC++ runtime repair"
     }
 
     try {
@@ -1720,6 +1871,10 @@ function Install-Backend {
         Write-Host "    Installing dependencies..." -ForegroundColor Gray
         Invoke-BackendLoggedCommand -LogPath $installLog -StepName "pip bootstrap" -Command { & $pythonExe -m pip install --upgrade pip setuptools wheel }
         Invoke-BackendLoggedCommand -LogPath $installLog -StepName "pip install requirements" -Command { & $pythonExe -m pip install --no-cache-dir -r (Join-Path $repoDir "requirements.txt") }
+
+        # Native ONNX Runtime on Windows requires the Microsoft Visual C++ runtime.
+        # Verify it now, repair the runtime automatically if needed, and fail before service creation if it still cannot load.
+        Repair-OnnxWindowsRuntime -PythonExe $pythonExe -LogPath $installLog
 
         # --- 4. Generate .env file before app import verification ---
         Write-Host "    Generating .env file..." -ForegroundColor Gray
