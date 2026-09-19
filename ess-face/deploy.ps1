@@ -16,7 +16,7 @@
 #   deploy.secrets.example.json - template with placeholder values
 # Runtime folders created by default:
 #   <drive>:\ESS\Ess_Face              - app services and runtime
-#   <drive>:\ESS\storage\employee-faces - persistent face profile images
+#   <drive>:\ESS\storage\face-images   - persistent face profile images
 # ===========================================================
 
 #Requires -RunAsAdministrator
@@ -528,11 +528,11 @@ function Get-MediaStoragePath {
         $configuredPath = "$($Config.MediaStoragePath)"
     }
     if ([string]::IsNullOrWhiteSpace($configuredPath)) {
-        return (Join-Path (Get-EssRootPath -Config $Config) "storage")
+        return (Join-Path (Join-Path (Get-EssRootPath -Config $Config) "storage") "face-images")
     }
     $expandedPath = [Environment]::ExpandEnvironmentVariables($configuredPath.Trim())
     if ($expandedPath -match '^/') {
-        throw "MediaStoragePath '$configuredPath' looks like a macOS/Linux path. Use a Windows path like C:\ESS\storage, or a relative path from the ESS root."
+        throw "MediaStoragePath '$configuredPath' looks like a macOS/Linux path. Use a Windows path like C:\ESS\storage\face-images, or a relative path from the ESS root."
     }
     if ([System.IO.Path]::IsPathRooted($expandedPath)) {
         return $expandedPath
@@ -547,10 +547,7 @@ function Convert-ToEnvPath {
 
 function Get-FaceImagesDirectory {
     param([Parameter(Mandatory=$true)][string]$MediaRoot)
-    if ((Split-Path -Path $MediaRoot -Leaf) -ieq "employee-faces") {
-        return $MediaRoot
-    }
-    return (Join-Path $MediaRoot "employee-faces")
+    return $MediaRoot
 }
 
 function Get-FrontendPublicUrl {
