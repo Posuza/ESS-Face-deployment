@@ -30,7 +30,7 @@ Created automatically on first run. Edit it to change:
 | `CaddyPort` | `9110` | Port the reverse proxy listens on | ✅ Change if needed |
 | `CaddyAdminPort` | `2110` | Caddy admin API port | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
-| `FrontendPublicUrl` | `null` | Public URL used in backend-generated links such as password reset emails. Blank/null uses `http://localhost:<CaddyPort>` | ✅ Set your LAN/DNS URL if users open the app from another computer |
+| `FrontendPublicUrl` | `null` | Public URL for the deployed frontend. Blank/null uses `http://localhost:<CaddyPort>` | ✅ Set your LAN/DNS URL if users open the app from another computer |
 | `MediaStoragePath` | `null` | Persistent backend face image folder. Blank/null uses `<drive>:\ESS\storage\face-images` | ✅ Set an absolute path, or a path relative to `<drive>:\ESS`. It must point directly to the folder that contains face JPEG files |
 | `InstallRoot` | *(set at startup)* | Derived from the selected drive and environment | ✅ `<drive>:\ESS\Ess_Face` for production, `<drive>:\ESS\Ess_Face_dev` for development |
 
@@ -42,14 +42,13 @@ Ready-to-use profiles are provided in `deploy.production.config.json` and
 `deploy.development.config.json`. Copy the required profile over
 `deploy.config.json` before running the deployment script.
 
-### `deploy.secrets.json` — credentials (DB, SMTP)
+### `deploy.secrets.json` — credentials (DB)
 
 Auto-gitignored. Copy `deploy.secrets.example.json` → `deploy.secrets.json` to pre-fill, or enter them when the script prompts you.
 
 ```json
 {
-  "db":   { "host": "localhost", "port": "3306", "name": "ess_face", "user": "root", "password": "..." },
-  "smtp": { "host": "smtp.gmail.com", "port": "587", "user": "...", "pass": "...", "from": "..." }
+  "db": { "host": "localhost", "port": "3306", "name": "ess_face", "user": "root", "password": "..." }
 }
 ```
 
@@ -61,7 +60,7 @@ Auto-gitignored. Copy `deploy.secrets.example.json` → `deploy.secrets.json` to
 
 ### 1. Prepare credentials
 
-Before running the script, make sure your DB and SMTP credentials are ready.
+Before running the script, make sure your DB credentials are ready.
 You can either:
 
 - **Pre-fill** `deploy.secrets.json` with your real values (copy from `deploy.secrets.example.json`)
@@ -113,7 +112,7 @@ Press **`2`** then **`A`** to install all components (or pick individually by nu
 
 The script will:
 1. Check prerequisites (Git, Node.js, Python) — installs missing ones
-2. Ask for DB/SMTP credentials (if not pre-filled)
+2. Ask for DB credentials (if not pre-filled)
 3. Install each component:
    - **Frontend** — clones repo, `npm install`, builds, registers as a Windows service
    - **Backend** — clones repo, cleans stale untracked files, creates venv, `pip install`, generates `.env`, creates persistent image storage, and registers the API service
@@ -216,4 +215,4 @@ Use **option 7** to manage which services Caddy proxies to:
 | `deploy.ps1` | Main deployment script | ✅ |
 | `deploy.config.json` | Ports, paths, repos, routes | ✅ |
 | `deploy.secrets.example.json` | Credentials template | ✅ |
-| `deploy.secrets.json` | Your real DB/SMTP credentials | ❌ (gitignored) |
+| `deploy.secrets.json` | Your real DB credentials | ❌ (gitignored) |

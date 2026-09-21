@@ -12,8 +12,10 @@
 #
 # Files created next to this script:
 #   deploy.config.json          - non-secret settings (install path, ports, repos)
-#   deploy.secrets.json         - DB/SMTP credentials (auto-added to .gitignore)
+#   deploy.secrets.json         - DB credentials (auto-added to .gitignore)
 #   deploy.secrets.example.json - template with placeholder values
+# Runtime deployment state:
+#   <InstallRoot>\deployment-state.json - last two known-good deployment versions
 # Runtime folders created by default:
 #   <drive>:\ESS\Ess_Face              - app services and runtime
 #   <drive>:\ESS\storage\face-images   - persistent face profile images
@@ -57,17 +59,17 @@ $SecretsExamplePath = Join-Path $ScriptRoot "deploy.secrets.example.json"
 $DefaultConfig = @{
     Environment = "production"
     FrontendRepo = "https://github.com/Posuza/ESS-Face-Frontend.git"
-    FrontendBranch = "ver1"
+    FrontendBranch = "main"
     BackendRepo  = "https://github.com/Posuza/ESS-Face-Backend.git"
-    BackendBranch = "ver1"
+    BackendBranch = "main"
     FrontendPort = 3110
     BackendPort  = 8110
     CaddyPort    = 9110
     CaddyAdminPort = 2110
     ApiPrefix    = "/api/v1"
     FrontendPublicUrl = $null
-    MediaStoragePath = $null
-    InstallRoot  = $null
+    MediaStoragePath = "E:\\ESS\\storage\\face-images"
+    InstallRoot  = "C:\\ESS\\Ess_Face"
 }
 
 # ---------- GLOBAL STATE ----------
@@ -77,6 +79,10 @@ $script:logFile = $null
 $script:dryRun = $DryRun
 $script:hasErrors = $false
 $script:headless = $Force -or ($Components.Count -gt 0)
+$script:deploymentTransaction = $false
+$script:deploymentCandidates = @{}
+$script:deploymentStateBeforeRun = $null
+$script:liveComponentsChanged = @()
 
 # ===========================================================
 # ENVIRONMENT-SPECIFIC NAMES
@@ -581,6 +587,324 @@ function Initialize-MediaStorage {
     return $mediaRoot
 }
 
+
+# ===========================================================
+# DEPLOYMENT STATE
+# One file at <InstallRoot>\deployment-state.json.
+# Keeps at most two full deployment versions.
+# Each component keeps current + previous known-good Git commit.
+# The file is updated ONLY after health verification succeeds.
+# ===========================================================
+function Get-DeploymentStatePath {
+    param($Config)
+    return (Join-Path $Config.InstallRoot "deployment-state.json")
+}
+
+function New-EmptyDeploymentComponents {
+    return [PSCustomObject]@{
+        frontend = [PSCustomObject]@{ current = $null; previous = $null }
+        backend  = [PSCustomObject]@{ current = $null; previous = $null }
+        caddy    = [PSCustomObject]@{ current = $null; previous = $null }
+    }
+}
+
+function Get-DeploymentState {
+    param($Config)
+    $path = Get-DeploymentStatePath -Config $Config
+    if (-not (Test-Path $path)) { return $null }
+    try {
+        return Get-Content -Path $path -Raw -ErrorAction Stop | ConvertFrom-Json
+    } catch {
+        Write-Warn "Could not read deployment state: $path"
+        Write-Log "Could not read deployment state $path : $_" -Level "ERROR"
+        return $null
+    }
+}
+
+function Save-DeploymentState {
+    param($Config, [Parameter(Mandatory=$true)]$State)
+    if ($script:dryRun) { return }
+    $path = Get-DeploymentStatePath -Config $Config
+    $tmp = "$path.tmp"
+    $State | ConvertTo-Json -Depth 10 | Set-Content -Path $tmp -Encoding UTF8 -Force
+    Move-Item -Path $tmp -Destination $path -Force
+    Write-Log "Deployment state saved: $path"
+}
+
+function Get-CurrentDeploymentVersion {
+    param($Config)
+    $state = Get-DeploymentState -Config $Config
+    if (-not $state -or -not $state.deploymentVersions -or @($state.deploymentVersions).Count -eq 0) {
+        return $null
+    }
+    return @($state.deploymentVersions)[0]
+}
+
+function Get-DeploymentComponentState {
+    param($Config, [Parameter(Mandatory=$true)][string]$Component)
+    $version = Get-CurrentDeploymentVersion -Config $Config
+    if (-not $version -or -not $version.components) { return $null }
+    return $version.components.$Component
+}
+
+function Get-DeploymentComponentCurrent {
+    param($Config, [Parameter(Mandatory=$true)][string]$Component)
+    $componentState = Get-DeploymentComponentState -Config $Config -Component $Component
+    if (-not $componentState) { return $null }
+    return "$($componentState.current)".Trim()
+}
+
+function Test-ComponentInstalled {
+    param($Config, [Parameter(Mandatory=$true)][string]$Component)
+    $svcName = Get-DeployServiceName -Config $Config -Component $Component
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    $base = Join-Path $Config.InstallRoot $Component
+
+    switch ($Component) {
+        "frontend" { return [bool]($svc -and (Test-Path (Join-Path $base "repo\.git"))) }
+        "backend"  { return [bool]($svc -and (Test-Path (Join-Path $base "repo\.git"))) }
+        "caddy"    { return [bool]($svc -and (Test-Path (Join-Path $base "caddy.exe"))) }
+    }
+    return $false
+}
+
+function Test-AnyComponentInstalled {
+    param($Config)
+    foreach ($key in @("frontend","backend","caddy")) {
+        if (Test-ComponentInstalled -Config $Config -Component $key) { return $true }
+    }
+    return $false
+}
+
+function Test-AllComponentsInstalled {
+    param($Config)
+    foreach ($key in @("frontend","backend","caddy")) {
+        if (-not (Test-ComponentInstalled -Config $Config -Component $key)) { return $false }
+    }
+    return $true
+}
+
+function Test-DeploymentRollbackAvailable {
+    param($Config)
+    $state = Get-DeploymentState -Config $Config
+    if (-not $state -or -not $state.deploymentVersions) { return $false }
+    return (@($state.deploymentVersions).Count -ge 2)
+}
+
+function Get-NextDeploymentVersionName {
+    param($State)
+    $max = 0
+    if ($State -and $State.deploymentVersions) {
+        foreach ($v in @($State.deploymentVersions)) {
+            if ("$($v.versionName)" -match '^v(\d+)$') {
+                $n = [int]$Matches[1]
+                if ($n -gt $max) { $max = $n }
+            }
+        }
+    }
+    return "v$($max + 1)"
+}
+
+function Copy-ObjectDeep {
+    param($Object)
+    if ($null -eq $Object) { return $null }
+    return ($Object | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
+}
+
+function Ensure-DeploymentStateForFirstSuccess {
+    param($Config)
+    $state = Get-DeploymentState -Config $Config
+    if ($state -and $state.deploymentVersions -and @($state.deploymentVersions).Count -gt 0) {
+        return $state
+    }
+
+    $state = [PSCustomObject]@{
+        deploymentVersions = @(
+            [PSCustomObject]@{
+                versionName = "v1"
+                components  = New-EmptyDeploymentComponents
+            }
+        )
+    }
+    return $state
+}
+
+function Register-SuccessfulComponentDeployment {
+    param(
+        $Config,
+        [Parameter(Mandatory=$true)][string]$Component,
+        [Parameter(Mandatory=$true)][string]$Commit
+    )
+
+    if ($script:deploymentTransaction) {
+        $script:deploymentCandidates[$Component] = $Commit
+        Write-Log "Candidate recorded for full deployment: $Component=$Commit"
+        return
+    }
+
+    $state = Ensure-DeploymentStateForFirstSuccess -Config $Config
+    $currentVersion = @($state.deploymentVersions)[0]
+    $componentState = $currentVersion.components.$Component
+
+    if (-not $componentState) {
+        $componentState = [PSCustomObject]@{ current = $null; previous = $null }
+        $currentVersion.components | Add-Member -NotePropertyName $Component -NotePropertyValue $componentState -Force
+    }
+
+    $oldCurrent = "$($componentState.current)".Trim()
+    if ($oldCurrent -eq $Commit) {
+        Write-Log "Deployment state unchanged for $Component; commit already current: $Commit"
+        if (-not (Test-Path (Get-DeploymentStatePath -Config $Config))) {
+            Save-DeploymentState -Config $Config -State $state
+        }
+        return
+    }
+
+    $componentState.previous = if ([string]::IsNullOrWhiteSpace($oldCurrent)) { $null } else { $oldCurrent }
+    $componentState.current = $Commit
+
+    Save-DeploymentState -Config $Config -State $state
+    Write-Success "$Component known-good commit: $Commit"
+}
+
+
+function Test-FullDeploymentHasChanges {
+    param($Config)
+
+    $state = Get-DeploymentState -Config $Config
+    if (-not $state -or -not $state.deploymentVersions -or @($state.deploymentVersions).Count -eq 0) {
+        return $true
+    }
+
+    $current = @($state.deploymentVersions)[0]
+    foreach ($key in @("frontend","backend","caddy")) {
+        if (-not $script:deploymentCandidates.ContainsKey($key)) { continue }
+        $candidate = "$($script:deploymentCandidates[$key])".Trim()
+        $old = "$($current.components.$key.current)".Trim()
+        if ($candidate -ne $old) { return $true }
+    }
+
+    return $false
+}
+
+function Complete-FullDeploymentState {
+    param($Config)
+
+    $state = Get-DeploymentState -Config $Config
+    $existing = $state -and $state.deploymentVersions -and @($state.deploymentVersions).Count -gt 0
+
+    if (-not $existing) {
+        $components = New-EmptyDeploymentComponents
+        foreach ($key in @("frontend","backend","caddy")) {
+            if ($script:deploymentCandidates.ContainsKey($key)) {
+                $components.$key.current = "$($script:deploymentCandidates[$key])"
+            }
+        }
+
+        $state = [PSCustomObject]@{
+            deploymentVersions = @(
+                [PSCustomObject]@{
+                    versionName = "v1"
+                    components = $components
+                }
+            )
+        }
+
+        Save-DeploymentState -Config $Config -State $state
+        Write-Success "Deployment version created automatically: v1"
+        return
+    }
+
+    if (-not (Test-FullDeploymentHasChanges -Config $Config)) {
+        Write-Success "All components are already current. No new deployment version created."
+        return
+    }
+
+    $oldVersion = @($state.deploymentVersions)[0]
+    $newVersion = Copy-ObjectDeep -Object $oldVersion
+    $newVersion.versionName = Get-NextDeploymentVersionName -State $state
+
+    foreach ($key in @("frontend","backend","caddy")) {
+        if (-not $script:deploymentCandidates.ContainsKey($key)) { continue }
+
+        $candidate = "$($script:deploymentCandidates[$key])".Trim()
+        $cs = $newVersion.components.$key
+
+        if (-not $cs) {
+            $cs = [PSCustomObject]@{ current = $null; previous = $null }
+            $newVersion.components | Add-Member -NotePropertyName $key -NotePropertyValue $cs -Force
+        }
+
+        $oldCurrent = "$($oldVersion.components.$key.current)".Trim()
+
+        if ($candidate -ne $oldCurrent) {
+            $cs.previous = if ([string]::IsNullOrWhiteSpace($oldCurrent)) { $null } else { $oldCurrent }
+            $cs.current = $candidate
+        }
+    }
+
+    # Keep only current + previous full deployment versions.
+    $state.deploymentVersions = @($newVersion, $oldVersion)
+    Save-DeploymentState -Config $Config -State $state
+    Write-Success "Deployment version promoted automatically: $($newVersion.versionName)"
+}
+
+function Get-GitHead {
+    param([Parameter(Mandatory=$true)][string]$RepoDir)
+    if (-not (Test-Path (Join-Path $RepoDir ".git"))) { return $null }
+    $head = (& git -C $RepoDir rev-parse HEAD 2>$null | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace("$head")) { return $null }
+    return "$head".Trim()
+}
+
+function Ensure-GitCommitAvailable {
+    param(
+        [Parameter(Mandatory=$true)][string]$RepoDir,
+        [Parameter(Mandatory=$true)][string]$Commit
+    )
+    & git -C $RepoDir cat-file -e "$Commit^{commit}" 2>$null
+    if ($LASTEXITCODE -eq 0) { return $true }
+
+    & git -C $RepoDir fetch origin $Commit 2>$null
+    if ($LASTEXITCODE -ne 0) { return $false }
+
+    & git -C $RepoDir cat-file -e "$Commit^{commit}" 2>$null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Initialize-CaddyLocalGit {
+    param($Config)
+    $caddyDir = Join-Path $Config.InstallRoot "caddy"
+    New-Item -Path $caddyDir -ItemType Directory -Force | Out-Null
+
+    $gitDir = Join-Path $caddyDir ".git"
+    if (-not (Test-Path $gitDir)) {
+        & git -C $caddyDir init | Out-Null
+        & git -C $caddyDir config user.name "ESS Deployment Manager"
+        & git -C $caddyDir config user.email "deployment@localhost"
+    }
+
+    $ignore = @"
+caddy.exe
+caddy-ports.json
+*.log
+"@
+    Set-Content -Path (Join-Path $caddyDir ".gitignore") -Value $ignore -Encoding UTF8 -Force
+}
+
+function Commit-CaddyLocalVersion {
+    param($Config, [string]$Message = "Known-good Caddy configuration")
+    $caddyDir = Join-Path $Config.InstallRoot "caddy"
+    Initialize-CaddyLocalGit -Config $Config
+
+    & git -C $caddyDir add Caddyfile caddy-run.ps1 .gitignore 2>$null
+    & git -C $caddyDir diff --cached --quiet 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        & git -C $caddyDir commit -m $Message | Out-Null
+    }
+    return (Get-GitHead -RepoDir $caddyDir)
+}
+
 function Get-RollbackRoot {
     param($Config)
     return (Join-Path $Config.InstallRoot "rollback")
@@ -614,23 +938,61 @@ function Get-RollbackState {
 function Save-BackendRollbackPoint {
     param($Config, [string]$LogPath = $null)
     if ($script:dryRun) { return }
-    $repoDir = Join-Path (Join-Path $Config.InstallRoot "backend") "repo"
+
+    $appDir = Join-Path $Config.InstallRoot "backend"
+    $repoDir = Join-Path $appDir "repo"
     if (-not (Test-Path (Join-Path $repoDir ".git"))) { return }
 
     $head = (& git -C $repoDir rev-parse HEAD 2>$null | Select-Object -First 1)
     if ([string]::IsNullOrWhiteSpace($head)) { return }
     $branch = (& git -C $repoDir rev-parse --abbrev-ref HEAD 2>$null | Select-Object -First 1)
+
+    $svcName = Get-DeployServiceName -Config $Config -Component "backend"
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+
+    $rollbackRoot = Get-RollbackRoot -Config $Config
+    New-Item -Path $rollbackRoot -ItemType Directory -Force | Out-Null
+
+    # Keep at most two known-good backend rollback snapshots.
+    $slot1State = Get-RollbackStatePath -Config $Config -Key "backend"
+    $slot2State = Get-RollbackStatePath -Config $Config -Key "backend-previous"
+    $slot1Env = Join-Path $rollbackRoot "backend.env.rollback"
+    $slot2Env = Join-Path $rollbackRoot "backend.previous.env.rollback"
+
+    if (Test-Path $slot1State) {
+        Copy-Item -Path $slot1State -Destination $slot2State -Force
+    }
+    if (Test-Path $slot1Env) {
+        Copy-Item -Path $slot1Env -Destination $slot2Env -Force
+    }
+
+    $envPath = Join-Path $repoDir ".env"
+    $envBackup = $null
+    if (Test-Path $envPath) {
+        $envBackup = $slot1Env
+        Copy-Item -Path $envPath -Destination $envBackup -Force
+    }
+
     $state = [PSCustomObject]@{
         Key = "backend"
         SavedAt = (Get-Date).ToString("o")
         RepoDir = $repoDir
+        AppDir = $appDir
         Commit = "$head"
         Branch = "$branch"
+        ServiceName = $svcName
+        ServiceExisted = [bool]($null -ne $svc)
+        ServiceWasRunning = [bool]($svc -and $svc.Status -eq 'Running')
+        EnvBackup = $envBackup
     }
-    Save-RollbackState -Config $Config -Key "backend" -State $state
-    if ($LogPath) { Write-FileLog -Path $LogPath -Text "Backend rollback point saved: $head" }
-}
 
+    Save-RollbackState -Config $Config -Key "backend" -State $state
+
+    if ($LogPath) {
+        Write-FileLog -Path $LogPath -Text "Backend rollback snapshot saved: commit=$head"
+        Write-FileLog -Path $LogPath -Text "Backend retention: 2 known-good rollback snapshots maximum"
+    }
+}
 function Save-CaddyRollbackPoint {
     param($Config, [string]$LogPath = $null)
     if ($script:dryRun) { return }
@@ -660,9 +1022,8 @@ function Save-CaddyRollbackPoint {
 }
 
 # ===========================================================
-# SECRETS (DB / SMTP credentials, stored outside the script)
+# SECRETS (DB credentials, stored outside the script)
 # Nested structure: db.host, db.port, db.name, db.user, db.password
-#                   smtp.host, smtp.port, smtp.user, smtp.pass, smtp.from
 # ===========================================================
 function Protect-SecretsFile {
     param([string]$Path = $SecretsPath)
@@ -692,13 +1053,6 @@ function Get-SecretsDefaults {
             name     = "ess_face"
             user     = "root"
             password = ""
-        }
-        smtp = [PSCustomObject]@{
-            host = "smtp.gmail.com"
-            port = 587
-            user = ""
-            pass = ""
-            from = ""
         }
     }
 }
@@ -746,16 +1100,6 @@ function Invoke-SecretsPrompt {
     $Secrets.db.user = Read-WithDefault -Default $Secrets.db.user -Prompt "  DB user"
     $Secrets.db.password = Read-WithDefault -Default $Secrets.db.password -Prompt "  DB password" -Mask
 
-    # --- SMTP section ---
-    Write-Host ""
-    Write-Host " [SMTP]" -ForegroundColor Magenta
-    $Secrets.smtp.host = Read-WithDefault -Default $Secrets.smtp.host -Prompt "  SMTP host"
-    $val = Read-WithDefault -Default $Secrets.smtp.port -Prompt "  SMTP port"
-    $Secrets.smtp.port = [int]$val
-    $Secrets.smtp.user = Read-WithDefault -Default $Secrets.smtp.user -Prompt "  SMTP user"
-    $Secrets.smtp.pass = Read-WithDefault -Default $Secrets.smtp.pass -Prompt "  SMTP app pass" -Mask
-    $Secrets.smtp.from = Read-WithDefault -Default $Secrets.smtp.from -Prompt "  SMTP from"
-
     # Save back to JSON
     $json = $Secrets | ConvertTo-Json -Depth 4
     Set-Content -Path $SecretsPath -Value $json -Force
@@ -794,10 +1138,6 @@ function Get-SecretsOrInitialize {
         if ($s.db.user     -match $placeholderPattern) { $placeholders += '  db.user (e.g. "root")' }
         if ($s.db.name     -match $placeholderPattern) { $placeholders += '  db.name (e.g. "ess_face")' }
         if ($s.db.password -match $placeholderPattern) { $placeholders += '  db.password (your MySQL password)' }
-        if ($s.smtp.user   -match $placeholderPattern) { $placeholders += '  smtp.user (your email)' }
-        if ($s.smtp.pass   -match $placeholderPattern) { $placeholders += '  smtp.pass (app password)' }
-        if ($s.smtp.from   -match $placeholderPattern) { $placeholders += '  smtp.from (from address)' }
-
         if ($placeholders.Count -gt 0) {
             Write-Host ""
             Write-Host " [!] deploy.secrets.json has placeholder values:" -ForegroundColor Yellow
@@ -814,9 +1154,6 @@ function Get-SecretsOrInitialize {
             Write-Host "  db.user     (your MySQL user)" -ForegroundColor Gray
             Write-Host "  db.name     (your MySQL database name)" -ForegroundColor Gray
             Write-Host "  db.password (your MySQL password)" -ForegroundColor Gray
-            Write-Host "  smtp.user   (your email)" -ForegroundColor Gray
-            Write-Host "  smtp.pass   (your SMTP app password)" -ForegroundColor Gray
-            Write-Host "  smtp.from   (from address)" -ForegroundColor Gray
             Write-Host ""
 
             if (-not $script:headless) {
@@ -865,9 +1202,6 @@ function Get-SecretsOrInitialize {
     Write-Host "  db.user     (your MySQL user)" -ForegroundColor Gray
     Write-Host "  db.name     (your MySQL database name)" -ForegroundColor Gray
     Write-Host "  db.password (your MySQL password)" -ForegroundColor Gray
-    Write-Host "  smtp.user   (your email)" -ForegroundColor Gray
-    Write-Host "  smtp.pass   (your SMTP app password)" -ForegroundColor Gray
-    Write-Host "  smtp.from   (from address)" -ForegroundColor Gray
     Write-Host ""
 
     if (-not $script:headless) {
@@ -923,10 +1257,6 @@ function Get-OrCreateSecrets {
     $defDbUser   = if ($existing) { $existing.db.user } else { "root" }
     $defDbName   = if ($existing) { $existing.db.name } else { "ess" }
     $defDbPass   = if ($existing) { $existing.db.password } else { "" }
-    $defSmtpUser = if ($existing) { $existing.smtp.user } else { "" }
-    $defSmtpPass = if ($existing) { $existing.smtp.pass } else { "" }
-    $defSmtpFrom = if ($existing) { $existing.smtp.from } else { "" }
-
     # Database settings
     Write-Host "-- Database --" -ForegroundColor Cyan
     $dbHostIn = Edit-WithDefault -Default $defDbHost -Prompt "#Edit or Skip for default > `"host`": `""
@@ -941,28 +1271,12 @@ function Get-OrCreateSecrets {
     $dbPassword = Edit-WithDefault -Default $defDbPass -Prompt "#Edit or Skip for default > `"password`": `""
     Write-Host "    `"password`": `"$dbPassword`"" -ForegroundColor Green
 
-    # SMTP settings
-    Write-Host "-- SMTP --" -ForegroundColor Cyan
-    $smtpUser = Edit-WithDefault -Default $defSmtpUser -Prompt "#Edit or Skip for default > `"user`": `""
-    Write-Host "    `"user`": `"$smtpUser`"" -ForegroundColor Green
-
-    $smtpPassword = Edit-WithDefault -Default $defSmtpPass -Prompt "#Edit or Skip for default > `"pass`": `""
-    Write-Host "    `"pass`": `"$smtpPassword`"" -ForegroundColor Green
-
-    $emailFrom = Edit-WithDefault -Default $defSmtpFrom -Prompt "#Edit or Skip for default > `"from`": `""
-    Write-Host "    `"from`": `"$emailFrom`"" -ForegroundColor Green
-
     $secrets = [PSCustomObject]@{
         db = [PSCustomObject]@{
             host     = $dbHostIn
             user     = $dbUser
             name     = $dbName
             password = $dbPassword
-        }
-        smtp = [PSCustomObject]@{
-            user = $smtpUser
-            pass = $smtpPassword
-            from = $emailFrom
         }
     }
     $secrets | ConvertTo-Json | Set-Content $SecretsPath
@@ -972,6 +1286,64 @@ function Get-OrCreateSecrets {
     return $secrets
 }
 #>
+
+
+# ===========================================================
+# DEPLOYMENT CREDENTIAL CONFIRMATION
+# Always shown for interactive first install and updates after
+# deploy.secrets.json has been loaded successfully.
+# Never prints actual passwords or SECRET_KEY values.
+# ===========================================================
+function Confirm-DeploymentCredentials {
+    param($Config, $Secrets)
+
+    if ($script:headless) {
+        return $true
+    }
+
+    $dbConfigured = (
+        $Secrets -and $Secrets.db -and
+        -not [string]::IsNullOrWhiteSpace("$($Secrets.db.host)") -and
+        -not [string]::IsNullOrWhiteSpace("$($Secrets.db.name)") -and
+        -not [string]::IsNullOrWhiteSpace("$($Secrets.db.user)")
+    )
+
+    $backendEnv = Join-Path (Join-Path (Join-Path $Config.InstallRoot "backend") "repo") ".env"
+    $secretKeyStatus = "will be generated on first successful backend install"
+
+    if (Test-Path $backendEnv) {
+        $secretLine = Get-Content $backendEnv -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match '^\s*SECRET_KEY\s*=' } |
+            Select-Object -First 1
+
+        if ($secretLine) {
+            $secretValue = (($secretLine -split '=', 2)[1]).Trim().Trim('"').Trim("'")
+            if (-not [string]::IsNullOrWhiteSpace($secretValue)) {
+                $secretKeyStatus = "existing / preserved"
+            }
+        }
+    }
+
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " Deployment Credentials" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host (" DB configuration   : " + $(if ($dbConfigured) { "configured" } else { "incomplete" })) `
+        -ForegroundColor $(if ($dbConfigured) { "Green" } else { "Yellow" })
+    Write-Host " SECRET_KEY         : $secretKeyStatus" -ForegroundColor Green
+    Write-Host ""
+    Write-Host " Source: $SecretsPath" -ForegroundColor Gray
+    Write-Host ""
+
+    if (-not (Confirm-Step "Continue deployment?" -DefaultYes:$true)) {
+        Write-Warn "Deployment cancelled by user."
+        Write-Log "Deployment cancelled at credential confirmation; no component update started" -Level "WARN"
+        return $false
+    }
+
+    Write-Success "Deployment credentials confirmed."
+    return $true
+}
 
 # ===========================================================
 # PREREQUISITES
@@ -1245,314 +1617,245 @@ function Verify-Health {
 
 # ===========================================================
 # COMPONENT INSTALLERS
-# Service names and install root are derived from the configured environment.
+# Existing component => update in place; missing component => first install.
 # ===========================================================
 function Install-Frontend {
     param($Config)
     Initialize-InstallRoot -Config $Config
-    Write-Step "Installing / Updating Frontend"
+
+    $appDir  = Join-Path $Config.InstallRoot "frontend"
+    $repoDir = Join-Path $appDir "repo"
+    $svcName = Get-DeployServiceName -Config $Config -Component "frontend"
+    $appPort = $Config.FrontendPort
+    $logsDir = Join-Path (Join-Path $Config.InstallRoot "logs") "frontend"
+    New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
+
+    $wasInstalled = Test-ComponentInstalled -Config $Config -Component "frontend"
+    $action = if ($wasInstalled) { "Updating" } else { "Installing" }
+    Write-Step "$action Frontend"
 
     if ($script:dryRun) {
-        Write-Warn "[DRY-RUN] Would install Frontend from $($Config.FrontendRepo), branch $($Config.FrontendBranch), on port $($Config.FrontendPort)"
+        Write-Warn "[DRY-RUN] Would $($action.ToLower()) Frontend from $($Config.FrontendRepo), branch $($Config.FrontendBranch)"
         return $true
     }
 
-    $appDir   = Join-Path $Config.InstallRoot "frontend"
-    $repoDir  = Join-Path $appDir "repo"
-    $webRoot  = Join-Path $appDir "webroot"
-    $relDir   = Join-Path $webRoot "releases"
-    $curLink  = Join-Path $webRoot "current"
-    $svcName  = Get-DeployServiceName -Config $Config -Component "frontend"
-    $appPort  = $Config.FrontendPort
-    $logsDir  = Join-Path (Join-Path $Config.InstallRoot "logs") "frontend"
-    New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
+    $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
+    $installLog = Join-Path $logsDir "frontend_${ts}.log"
+    $oldGood = Get-DeploymentComponentCurrent -Config $Config -Component "frontend"
+    if ([string]::IsNullOrWhiteSpace($oldGood) -and (Test-Path (Join-Path $repoDir ".git"))) {
+        $oldGood = Get-GitHead -RepoDir $repoDir
+    }
 
-    # Track whether we've swapped, for auto-rollback on failure
-    $swapped = $false
-    $prevTarget = $null
+    $liveFrontendChanged = $false
 
     try {
-        New-Item -Path $relDir -ItemType Directory -Force | Out-Null
+        New-Item -Path $appDir -ItemType Directory -Force | Out-Null
 
-        $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $installLog = Join-Path $logsDir "frontend_install_${ts}.log"
-
-        # --- 1. Persistent repo ---
         if (Test-Path (Join-Path $repoDir ".git")) {
-            Write-Host "    Updating repo..." -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
-            Push-Location $repoDir
-            git fetch --depth 1 --prune origin "+refs/heads/$($Config.FrontendBranch):refs/remotes/origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
-            if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
-            git reset --hard "origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
-            if ($LASTEXITCODE -ne 0) { throw "git reset failed with exit code $LASTEXITCODE" }
-            git clean -fd 2>&1 | Add-FileLog -Path $installLog
-            if ($LASTEXITCODE -ne 0) { throw "git clean failed with exit code $LASTEXITCODE" }
-            Pop-Location
-        } else {
-            Write-Host "    Cloning repo (first time)..." -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "First-time clone"
-            if (Test-Path $repoDir) { Remove-Item $repoDir -Recurse -Force }
-            git clone --depth 1 --branch $Config.FrontendBranch $Config.FrontendRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
-            if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
+            Write-Host "    Checking Git for frontend update..." -ForegroundColor Gray
+            git -C $repoDir fetch --prune origin "+refs/heads/$($Config.FrontendBranch):refs/remotes/origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) {
+                throw "Frontend branch '$($Config.FrontendBranch)' could not be fetched. Check FrontendBranch in deploy.config.json. Live frontend was not changed."
+            }
+
+            $remoteHead = (& git -C $repoDir rev-parse "origin/$($Config.FrontendBranch)" 2>$null | Select-Object -First 1).Trim()
+            $localHead = (Get-GitHead -RepoDir $repoDir)
+
+            if ($wasInstalled -and $localHead -eq $remoteHead) {
+                Write-Success "Frontend is already up to date: $localHead"
+                Register-SuccessfulComponentDeployment -Config $Config -Component "frontend" -Commit $localHead
+                return $true
+            }
+
+            if ($wasInstalled) {
+                $candidateDir = Join-Path $appDir "_candidate_frontend"
+                Write-Host "    Validating frontend candidate before changing the active version..." -ForegroundColor Cyan
+
+                & git -C $repoDir worktree remove --force $candidateDir 2>$null | Out-Null
+                if (Test-Path $candidateDir) {
+                    Remove-Item -Path $candidateDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                & git -C $repoDir worktree prune 2>$null | Out-Null
+
+                try {
+                    & git -C $repoDir worktree add --detach $candidateDir $remoteHead 2>&1 | Add-FileLog -Path $installLog
+                    if ($LASTEXITCODE -ne 0) { throw "Could not create frontend candidate worktree." }
+
+                    Push-Location $candidateDir
+                    try {
+                        npm install --legacy-peer-deps 2>&1 | Add-FileLog -Path $installLog
+                        if ($LASTEXITCODE -ne 0) { throw "Frontend candidate npm install failed." }
+
+                        $env:VITE_API_URL = $Config.ApiPrefix
+                        npm run build 2>&1 | Add-FileLog -Path $installLog
+                        if ($LASTEXITCODE -ne 0) { throw "Frontend candidate build failed. Live frontend was not changed." }
+
+                        if (-not (Test-Path (Join-Path $candidateDir "dist"))) {
+                            throw "Frontend candidate build did not create dist. Live frontend was not changed."
+                        }
+                    }
+                    finally {
+                        Pop-Location
+                    }
+
+                    Write-Success "Frontend candidate validation passed: $remoteHead"
+                }
+                finally {
+                    & git -C $repoDir worktree remove --force $candidateDir 2>$null | Out-Null
+                    if (Test-Path $candidateDir) {
+                        Remove-Item -Path $candidateDir -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    & git -C $repoDir worktree prune 2>$null | Out-Null
+                }
+            }
+
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Stopped') {
+                Stop-Service -Name $svcName -ErrorAction Stop
+                Start-Sleep -Seconds 2
+            }
+
+            $liveFrontendChanged = $true
+            $script:liveComponentsChanged += "frontend"
+            git -C $repoDir reset --hard "origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "Frontend git reset failed." }
+
+            # -fd does not remove ignored node_modules/.env. Never use git clean -fdx here.
+            git -C $repoDir clean -fd 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "Frontend git clean failed." }
+        }
+        else {
+            Write-Host "    First install: cloning frontend..." -ForegroundColor Gray
+            if (Test-Path $repoDir) { Remove-Item -Path $repoDir -Recurse -Force }
+            git clone --branch $Config.FrontendBranch $Config.FrontendRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "Frontend git clone failed." }
         }
 
-        # --- 2. npm install ---
-        Write-Host "    Installing dependencies..." -ForegroundColor Gray
-        Push-Location $repoDir
-        npm install --legacy-peer-deps 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "npm install --legacy-peer-deps failed with exit code $LASTEXITCODE" }
-        npm install --no-save serve --legacy-peer-deps 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "npm install serve --legacy-peer-deps failed with exit code $LASTEXITCODE" }
+        $candidate = Get-GitHead -RepoDir $repoDir
+        if ([string]::IsNullOrWhiteSpace($candidate)) { throw "Could not determine frontend Git HEAD." }
 
-        # --- 3. Build ---
-        Write-Host "    Building..." -ForegroundColor Gray
-        $env:VITE_API_URL = $Config.ApiPrefix
-        npm run build 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE" }
-        Pop-Location
+        Write-Host "    Synchronizing frontend dependencies (node_modules is kept)..." -ForegroundColor Gray
+        Push-Location $repoDir
+        try {
+            npm install --legacy-peer-deps 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "npm install failed." }
+
+            $serveMain = Join-Path $repoDir "node_modules\serve\build\main.js"
+            if (-not (Test-Path $serveMain)) {
+                npm install --no-save serve --legacy-peer-deps 2>&1 | Add-FileLog -Path $installLog
+                if ($LASTEXITCODE -ne 0) { throw "npm install serve failed." }
+            }
+
+            $env:VITE_API_URL = $Config.ApiPrefix
+            npm run build 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "npm run build failed." }
+        }
+        finally {
+            Pop-Location
+        }
 
         $distDir = Join-Path $repoDir "dist"
-        if (-not (Test-Path $distDir)) {
-            throw "Frontend build failed - dist folder not created"
-        }
+        if (-not (Test-Path $distDir)) { throw "Frontend dist folder was not created." }
 
-        # --- 4. Save previous symlink target before swapping ---
-        $prevTarget = if (Test-Path $curLink) {
-            try { (Get-Item $curLink -ErrorAction Stop).Target } catch { $null }
-        } else { $null }
-
-        # --- 5. Create new release ---
-        $releaseDir = Join-Path $relDir $ts
-        # Ensure destination exists (avoid Copy-Item container/leaf ambiguity)
-        New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-        Copy-Item -Path "$distDir\*" -Destination $releaseDir -Recurse -Force
-        Write-Success "Release created: $ts"
-        Write-FileLog -Path $installLog -Text "Release created: $releaseDir"
-
-        # --- 6. Swap symlink: current → new release ---
-        if (Test-Path $curLink) { Remove-Item $curLink -Force }
-        New-Item -ItemType SymbolicLink -Path $curLink -Target $releaseDir -Force | Out-Null
-        $swapped = $true
-        Write-Success "Symlink swapped: current → $ts"
-        Write-FileLog -Path $installLog -Text "Symlink: $curLink → $releaseDir"
-
-        # --- 7. Create / update service (PowerShell runner) ---
         $runnerScript = Join-Path $appDir "frontend-run.ps1"
         $runnerContent = @'
 $ErrorActionPreference = "Stop"
-
 $frontendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoDir     = Join-Path $frontendDir "repo"
-$webRoot     = Join-Path $frontendDir "webroot"
-$curLink     = Join-Path $webRoot "current"
-$logsDir     = Join-Path (Join-Path (Split-Path $frontendDir -Parent) "logs") "frontend"
-
-if (-not (Test-Path $logsDir)) {
-    New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
-}
-
-$svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
-$serviceLog = Join-Path $logsDir "frontend_service_${svcTs}.log"
-
-function Write-ServiceLog {
-    param([string]$Text)
-    $line = "[{0}] {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $Text
-    Add-Content -Path $serviceLog -Value $line -Encoding UTF8
-}
-
+$repoDir = Join-Path $frontendDir "repo"
+$distDir = Join-Path $repoDir "dist"
+$serveMain = Join-Path $repoDir "node_modules\serve\build\main.js"
+$logsDir = Join-Path (Join-Path (Split-Path $frontendDir -Parent) "logs") "frontend"
+if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
+$serviceLog = Join-Path $logsDir ("frontend_service_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+function Log([string]$m) { "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),$m | Add-Content -Path $serviceLog }
 try {
-    Write-ServiceLog "========== Service started =========="
-    Write-ServiceLog "Frontend directory: $frontendDir"
-    Write-ServiceLog "Repo directory: $repoDir"
-    Write-ServiceLog "Webroot current: $curLink"
-
-    if (-not (Test-Path $curLink)) {
-        throw "Webroot current path not found: $curLink"
-    }
-
-    $nodeCmd = Get-Command node.exe -ErrorAction SilentlyContinue
-    if (-not $nodeCmd) {
-        throw "node.exe not found in PATH. Please install Node.js or add node.exe to system PATH."
-    }
-
-    $nodeExe = $nodeCmd.Source
-    Write-ServiceLog "Node executable: $nodeExe"
-
-    $serveMain = Join-Path $repoDir "node_modules\serve\build\main.js"
-
-    if (-not (Test-Path $serveMain)) {
-        throw "Local serve package not found: $serveMain. Run npm install serve in $repoDir or rerun deploy."
-    }
-
-    Write-ServiceLog "Starting frontend server:"
-    Write-ServiceLog "`"$nodeExe`" `"$serveMain`" -s `"$curLink`" -l __FRONTEND_PORT__"
-
-    Set-Location -Path $frontendDir
-
-    & $nodeExe $serveMain -s $curLink -l __FRONTEND_PORT__ 2>&1 |
-        ForEach-Object {
-            Write-ServiceLog $_
-        }
-
-    $exitCode = $LASTEXITCODE
-    Write-ServiceLog "Frontend server process exited with code: $exitCode"
-    exit $exitCode
-}
-catch {
-    Write-ServiceLog "ERROR: $($_.Exception.Message)"
-    Write-ServiceLog "========== Service STOPPED WITH ERROR =========="
+    if (-not (Test-Path $distDir)) { throw "dist not found: $distDir" }
+    if (-not (Test-Path $serveMain)) { throw "serve not found: $serveMain" }
+    $node = (Get-Command node.exe -ErrorAction Stop).Source
+    Log "Serving $distDir on __FRONTEND_PORT__"
+    & $node $serveMain -s $distDir -l "__FRONTEND_PORT__" 2>&1 | ForEach-Object { Log "$_" }
+    exit $LASTEXITCODE
+} catch {
+    Log "ERROR: $($_.Exception.Message)"
     exit 1
 }
-finally {
-    Write-ServiceLog "========== Service stopped =========="
-}
 '@
-        $runnerContent = $runnerContent.Replace('__FRONTEND_PORT__', $appPort)
-        Set-Content -Path $runnerScript -Value $runnerContent -Force
-        Write-FileLog -Path $installLog -Text "Runner script written to $runnerScript"
+        $runnerContent = $runnerContent.Replace('__FRONTEND_PORT__', "$appPort")
+        Set-Content -Path $runnerScript -Value $runnerContent -Encoding UTF8 -Force
 
-        $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-        $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
-
-        Write-FileLog -Path $installLog -Text "--- Service creation ---"
-        Write-FileLog -Path $installLog -Text "Service name: $svcName"
-        Write-FileLog -Path $installLog -Text "Executable: $powershellExe"
-        Write-FileLog -Path $installLog -Text "Parameters: $paramStr"
-
-        $existingSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-        if ($existingSvc) {
-            Write-Host "    Existing frontend service found: $svcName ($($existingSvc.Status))" -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "Existing service found: $svcName status=$($existingSvc.Status)"
-
-            if ($existingSvc.Status -ne 'Stopped') {
-                Write-Host "    Stopping frontend service..." -ForegroundColor Gray
-                Write-FileLog -Path $installLog -Text "Stopping existing frontend service"
-                Stop-Service -Name $svcName -ErrorAction Stop
-
-                $stopped = $false
-                for ($i = 1; $i -le 10; $i++) {
-                    Start-Sleep -Seconds 2
-                    $checkSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-                    if (-not $checkSvc -or $checkSvc.Status -eq 'Stopped') {
-                        $stopped = $true
-                        break
-                    }
-                    Write-FileLog -Path $installLog -Text "Stop wait $i/10: status=$($checkSvc.Status)"
-                }
-
-                if (-not $stopped) {
-                    throw "Existing service '$svcName' did not stop. Stop it manually, then rerun deploy."
-                }
-                Write-Success "Frontend service stopped"
-                Write-FileLog -Path $installLog -Text "Existing frontend service stopped"
-            }
-
-            Write-Host "    Unregistering existing frontend service..." -ForegroundColor Gray
-            servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $installLog
-            Start-Sleep -Seconds 2
-
-            if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
-                throw "Existing service '$svcName' could not be uninstalled. Uninstall it manually, then rerun deploy."
-            }
-            Write-FileLog -Path $installLog -Text "Existing frontend service unregistered"
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
+            servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
+            if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) { throw "Frontend service creation failed." }
+            sc.exe config "$svcName" start= delayed-auto | Out-Null
+            sc.exe failure "$svcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
+            sc.exe failureflag "$svcName" 1 | Out-Null
+            Write-Success "Frontend service created"
+        }
+        else {
+            Write-Success "Frontend service registration kept"
         }
 
-        servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
-
-        if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
-            throw "Service '$svcName' was not created by servy-cli"
-        }
-        sc.exe config "$svcName" start= delayed-auto 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to configure service '$svcName' for automatic startup"
-        }
-        sc.exe failure "$svcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service '$svcName'" }
-        sc.exe failureflag "$svcName" 1 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service '$svcName'" }
-        Write-FileLog -Path $installLog -Text "Service $svcName startup type set to Automatic (Delayed Start)"
-        Write-FileLog -Path $installLog -Text "Service $svcName recovery actions configured"
-        Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
-        Write-Success "Service updated: $svcName"
-
-        # --- 8. Start service and verify frontend endpoint ---
-        Write-Host "    Starting frontend service to verify..." -ForegroundColor Gray
-        Write-FileLog -Path $installLog -Text "Starting frontend service..."
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Stopped') { Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1 }
         Start-Service -Name $svcName -ErrorAction Stop
-        Write-FileLog -Path $installLog -Text "Start-Service command issued"
 
-        $healthUrl = "http://127.0.0.1:$appPort"
-        $healthOk = $false
-        for ($i = 1; $i -le 15; $i++) {
-            Start-Sleep -Seconds 2
-            $svcStatus = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            Write-FileLog -Path $installLog -Text "Frontend poll $i/15: service status=$($svcStatus.Status) url=$healthUrl"
+        $healthOk = Test-Endpoint -Url "http://127.0.0.1:$appPort" -Name "Frontend" -TimeoutSec 5 -Retries 7 -RetryDelaySec 2
+        if (-not $healthOk) { throw "Frontend candidate did not pass health check." }
 
-            if (-not $svcStatus -or $svcStatus.Status -ne 'Running') {
-                continue
-            }
-
-            try {
-                $healthResponse = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-                if ($healthResponse.StatusCode -ge 200 -and $healthResponse.StatusCode -lt 400) {
-                    $healthOk = $true
-                    Write-Success "Frontend health check passed (HTTP $($healthResponse.StatusCode))"
-                    Write-FileLog -Path $installLog -Text "Frontend health check OK: status=$($healthResponse.StatusCode)"
-                    break
-                }
-            } catch {
-                Write-FileLog -Path $installLog -Text "Frontend poll $i failed: $_"
-            }
-        }
-
-        if (-not $healthOk) {
-            $latestServiceLog = Get-ChildItem -Path $logsDir -Filter "frontend_service_*.log" -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($latestServiceLog) {
-                Write-FileLog -Path $installLog -Text "--- Last 80 lines of $($latestServiceLog.Name) ---"
-                Get-Content $latestServiceLog.FullName -ErrorAction SilentlyContinue | Select-Object -Last 80 | ForEach-Object {
-                    Write-FileLog -Path $installLog -Text $_
-                }
-                Write-FileLog -Path $installLog -Text "--- end $($latestServiceLog.Name) ---"
-            }
-            throw "Frontend service did not pass health check: $healthUrl"
-        }
-
-        Write-Host "    Frontend service verified" -ForegroundColor Gray
-        Write-FileLog -Path $installLog -Text "Frontend verification complete"
-
-        # --- 9. Auto-cleanup: keep last 3 releases ---
-        $keepCount = 3
-        $releases = Get-ChildItem -Path $relDir -Directory | Sort-Object Name -Descending
-        if ($releases.Count -gt $keepCount) {
-            $releases | Select-Object -Skip $keepCount | ForEach-Object {
-                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-                Write-FileLog -Path $installLog -Text "Cleaned up old release: $($_.Name)"
-            }
-            Write-Success "Cleaned up old releases (kept last $keepCount)"
-        }
-
+        Register-SuccessfulComponentDeployment -Config $Config -Component "frontend" -Commit $candidate
         $script:installedComponents += "frontend"
-        Write-Log "Frontend installed/updated successfully (release: $ts, port: $appPort)"
+        Write-Success "Frontend update successful: $candidate"
         return $true
-
-    } catch {
+    }
+    catch {
         Write-Err "Frontend setup failed: $_"
-        Write-Log "Frontend installation failed: $_" -Level "ERROR"
 
-        # Auto-rollback: if we swapped symlink and old release exists, restore it
-        if ($swapped -and $prevTarget -and (Test-Path $prevTarget)) {
-            Write-Warn "Auto-rolling back to previous release..."
-            Remove-Item $curLink -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType SymbolicLink -Path $curLink -Target $prevTarget -Force | Out-Null
-            Write-Success "Rolled back to previous release"
-            Write-Log "Auto-rollback to $prevTarget after install failure" -Level "WARN"
+        if (-not $liveFrontendChanged -and $wasInstalled) {
+            Write-Warn "Frontend update failed before live promotion."
+            Write-Success "Active frontend remains unchanged at: $oldGood"
+            Write-Log "Frontend update failed before live promotion; no service or repo restore required" -Level "WARN"
         }
+        elseif ($liveFrontendChanged -and -not [string]::IsNullOrWhiteSpace($oldGood) -and (Test-Path (Join-Path $repoDir ".git"))) {
+            Write-Warn "Frontend live promotion failed. Automatically restoring known-good commit: $oldGood"
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Stopped') { Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue }
 
+            if (-not (Ensure-GitCommitAvailable -RepoDir $repoDir -Commit $oldGood)) {
+                Write-Err "Could not make previous frontend commit available locally: $oldGood"
+                return $false
+            }
+
+            git -C $repoDir reset --hard $oldGood | Out-Null
+            Push-Location $repoDir
+            try {
+                npm install --legacy-peer-deps | Out-Null
+                $env:VITE_API_URL = $Config.ApiPrefix
+                npm run build | Out-Null
+            } finally { Pop-Location }
+
+            Start-Service -Name $svcName -ErrorAction SilentlyContinue
+            if (Test-Endpoint -Url "http://127.0.0.1:$appPort" -Name "Frontend restored" -TimeoutSec 5 -Retries 5 -RetryDelaySec 2) {
+                Write-Success "Frontend restored to known-good commit: $oldGood"
+            } else {
+                Write-Err "Frontend rollback health check failed."
+            }
+        }
+        elseif (-not $wasInstalled) {
+            # Failed first install never becomes deployment state.
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc) {
+                Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+                servy-cli uninstall --name="$svcName" --quiet | Out-Null
+            }
+            Write-Warn "Failed first frontend install was not recorded as a deployment version."
+        }
         return $false
     }
 }
+
 
 function Install-Backend {
     param($Config, $Secrets)
@@ -1623,14 +1926,8 @@ function Install-Backend {
                     Start-Sleep -Seconds 3
                 }
 
-                Write-Host "    Uninstalling service registration: $serviceName..." -ForegroundColor Gray
-                servy-cli uninstall --name="$serviceName" --quiet 2>&1 | Add-FileLog -Path $LogPath
-                Start-Sleep -Seconds 2
-
-                $svcAfter = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-                if ($svcAfter) {
-                    throw "Existing service '$serviceName' could not be uninstalled. Stop/uninstall it first, then rerun deploy."
-                }
+                Write-Host "    Keeping existing service registration for update: $serviceName" -ForegroundColor Gray
+                Write-FileLog -Path $LogPath -Text "Update mode: service registration preserved for $serviceName"
             }
         }
 
@@ -1799,18 +2096,36 @@ function Install-Backend {
         Write-FileLog -Path $installLog -Text "Branch: $($Config.BackendBranch)"
         Write-FileLog -Path $installLog -Text "RepoDir: $repoDir"
         Write-FileLog -Path $installLog -Text "Port: $appPort"
-        Save-BackendRollbackPoint -Config $Config -LogPath $installLog
+        $oldGoodBackend = Get-DeploymentComponentCurrent -Config $Config -Component "backend"
+        if ([string]::IsNullOrWhiteSpace($oldGoodBackend) -and (Test-Path (Join-Path $repoDir ".git"))) {
+            $oldGoodBackend = Get-GitHead -RepoDir $repoDir
+        }
 
-        # --- 0. Stop/uninstall API service before touching repo/venv ---
-        Stop-BackendRuntime -ServiceNames @($svcName) -AppDir $appDir -RepoDir $repoDir -LogPath $installLog
+        # --- 0. Check Git before stopping a healthy existing service ---
+        # Service is stopped only when a real backend update is required.
 
         # --- 1. Clone or hard-reset backend repo ---
         if (Test-Path (Join-Path $repoDir ".git")) {
-            Write-Host "    Updating repo..." -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "Repo exists, updating via git fetch + reset"
+            Write-Host "    Checking Git for backend update..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Repo exists, checking remote HEAD"
             Push-Location $repoDir
             try {
-                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --depth 1 --prune origin "+refs/heads/$($Config.BackendBranch):refs/remotes/origin/$($Config.BackendBranch)" }
+                Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --prune origin "+refs/heads/$($Config.BackendBranch):refs/remotes/origin/$($Config.BackendBranch)" }
+
+                $localHead = (& git rev-parse HEAD 2>$null | Select-Object -First 1).Trim()
+                $remoteHead = (& git rev-parse "origin/$($Config.BackendBranch)" 2>$null | Select-Object -First 1).Trim()
+
+                if ($localHead -eq $remoteHead -and (Test-ComponentInstalled -Config $Config -Component "backend")) {
+                    Write-Success "Backend is already up to date: $localHead"
+                    Register-SuccessfulComponentDeployment -Config $Config -Component "backend" -Commit $localHead
+
+                    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                    if ($svc -and $svc.Status -eq 'Stopped') {
+                        Start-Service -Name $svcName -ErrorAction SilentlyContinue
+                    }
+                    return $true
+                }
+
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git reset" -Command { git reset --hard "origin/$($Config.BackendBranch)" }
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git clean" -Command { git clean -fd }
             } finally {
@@ -1823,40 +2138,44 @@ function Install-Backend {
                 Remove-PathStrict -Path $repoDir -LogPath $installLog
             }
             New-Item -Path $appDir -ItemType Directory -Force | Out-Null
-            Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git clone" -Command { git clone --depth 1 --branch $Config.BackendBranch $Config.BackendRepo $repoDir }
+            Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git clone" -Command { git clone --branch $Config.BackendBranch $Config.BackendRepo $repoDir }
             if (-not (Test-Path (Join-Path $repoDir ".git"))) {
                 throw "Git clone completed but .git folder is missing: $repoDir"
             }
         }
 
-        # --- 2. Recreate virtual environment every backend deployment to avoid partially deleted/broken venv ---
+        # A real backend change is being applied; now stop its runtime.
+        Stop-BackendRuntime -ServiceNames @($svcName) -AppDir $appDir -RepoDir $repoDir -LogPath $installLog
+
+        # --- 2. Reuse virtual environment on update; create only when missing ---
         $venvDir = Join-Path $repoDir "venv"
         $pythonExe = Join-Path $venvDir "Scripts\python.exe"
 
-        if (Test-Path $venvDir) {
-            Write-Host "    Removing existing virtual environment..." -ForegroundColor Gray
-            Remove-PathStrict -Path $venvDir -LogPath $installLog
-        }
-
-        Write-Host "    Creating virtual environment..." -ForegroundColor Gray
-        $creator = Get-BackendPythonCreator -LogPath $installLog
-        Push-Location $repoDir
-        try {
-            $creatorFile = $creator.File
-            $creatorArgs = @()
-            $creatorArgs += $creator.Args
-            $creatorArgs += @("-m", "venv", "venv")
-            Write-FileLog -Path $installLog -Text "Creating venv command: $creatorFile $($creatorArgs -join ' ')"
-            & $creatorFile @creatorArgs 2>&1 | Add-FileLog -Path $installLog
-            if ($LASTEXITCODE -ne 0) {
-                throw "Virtual environment creation failed with exit code $LASTEXITCODE"
+        if (-not (Test-Path $pythonExe)) {
+            Write-Host "    Backend venv not found. Creating virtual environment..." -ForegroundColor Gray
+            $creator = Get-BackendPythonCreator -LogPath $installLog
+            Push-Location $repoDir
+            try {
+                $creatorFile = $creator.File
+                $creatorArgs = @()
+                $creatorArgs += $creator.Args
+                $creatorArgs += @("-m", "venv", "venv")
+                Write-FileLog -Path $installLog -Text "Creating venv command: $creatorFile $($creatorArgs -join ' ')"
+                & $creatorFile @creatorArgs 2>&1 | Add-FileLog -Path $installLog
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Virtual environment creation failed with exit code $LASTEXITCODE"
+                }
+            } finally {
+                Pop-Location
             }
-        } finally {
-            Pop-Location
+        }
+        else {
+            Write-Success "Backend update mode: existing venv kept"
+            Write-FileLog -Path $installLog -Text "Existing backend venv reused"
         }
 
         if (-not (Test-Path $pythonExe)) {
-            throw "Virtual environment was not created: $pythonExe"
+            throw "Virtual environment is unavailable: $pythonExe"
         }
 
         # --- 3. Verify venv python and install dependencies ---
@@ -1882,25 +2201,35 @@ function Install-Backend {
         $envMediaStoragePath = Convert-ToEnvPath -Path $mediaStoragePath
         Write-Host "    Media storage: $mediaStoragePath" -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Media storage path: $mediaStoragePath"
-        $rawKey = & $pythonExe -c "import secrets; print(secrets.token_hex(32))" 2>&1
-        $generatedKey = ($rawKey | Select-Object -Last 1).Trim()
-        if ([string]::IsNullOrWhiteSpace($generatedKey) -or $generatedKey.Length -lt 16) {
-            Write-Warn "Python key generation failed or returned invalid value, using fallback"
-            Write-FileLog -Path $installLog -Text "Python key generation returned: '$rawKey', using fallback"
-            $generatedKey = [System.Guid]::NewGuid().ToString("N") + [System.Guid]::NewGuid().ToString("N")
+        # Preserve SECRET_KEY directly from the persistent .env on updates/rollbacks.
+        $generatedKey = $null
+        $existingEnvPath = Join-Path $repoDir ".env"
+        if (Test-Path $existingEnvPath) {
+            $oldSecretLine = Get-Content $existingEnvPath -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '^\s*SECRET_KEY\s*=' } |
+                Select-Object -First 1
+            if ($oldSecretLine) {
+                $generatedKey = (($oldSecretLine -split '=', 2)[1]).Trim().Trim('"').Trim("'")
+                if (-not [string]::IsNullOrWhiteSpace($generatedKey)) {
+                    Write-FileLog -Path $installLog -Text "SECRET_KEY preserved from persistent backend .env"
+                }
+            }
         }
-        Write-FileLog -Path $installLog -Text "SECRET_KEY generated ($($generatedKey.Length) chars)"
+
+        if ([string]::IsNullOrWhiteSpace($generatedKey)) {
+            $rawKey = & $pythonExe -c "import secrets; print(secrets.token_hex(32))" 2>&1
+            $generatedKey = ($rawKey | Select-Object -Last 1).Trim()
+            if ([string]::IsNullOrWhiteSpace($generatedKey) -or $generatedKey.Length -lt 16) {
+                $generatedKey = [System.Guid]::NewGuid().ToString("N") + [System.Guid]::NewGuid().ToString("N")
+            }
+            Write-FileLog -Path $installLog -Text "SECRET_KEY generated for first backend install"
+        }
 
         $envDbUser   = $Secrets.db.user.Replace('\', '\\').Replace('"', '\"')
         $envDbPass   = $Secrets.db.password.Replace('\', '\\').Replace('"', '\"')
         $envDbHost   = $Secrets.db.host.Replace('\', '\\').Replace('"', '\"')
         $envDbName   = $Secrets.db.name.Replace('\', '\\').Replace('"', '\"')
         $envDbPort   = [int]$Secrets.db.port
-        $envSmtpHost = $Secrets.smtp.host.Replace('\', '\\').Replace('"', '\"')
-        $envSmtpPort = [int]$Secrets.smtp.port
-        $envSmtpUser = $Secrets.smtp.user.Replace('\', '\\').Replace('"', '\"')
-        $envSmtpPass = $Secrets.smtp.pass.Replace('\', '\\').Replace('"', '\"')
-        $envSmtpFrom = $Secrets.smtp.from.Replace('\', '\\').Replace('"', '\"')
         $envFrontendUrl = (Get-FrontendPublicUrl -Config $Config).Replace('\', '\\').Replace('"', '\"')
 
         $envContent = @"
@@ -1915,13 +2244,7 @@ SECRET_KEY=$generatedKey
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 
-SMTP_HOST=$envSmtpHost
-SMTP_PORT=$envSmtpPort
-SMTP_USER="$envSmtpUser"
-SMTP_PASS="$envSmtpPass"
-EMAIL_FROM="$envSmtpFrom"
 FRONTEND_URL="$envFrontendUrl"
-RESET_EXPIRE_MINUTES=15
 MFA_ISSUER_NAME="ESS Face"
 
 MEDIA_STORAGE_PATH="$envMediaStoragePath"
@@ -2021,35 +2344,38 @@ catch {
         Set-Content -Path $runnerScript -Value $runnerContent -Force -Encoding UTF8
         Write-FileLog -Path $installLog -Text "Runner script written to $runnerScript"
 
-        # --- 7. Create backend service ---
+        # --- 7. Create backend service only on first install; reuse it on update ---
         $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
 
-        Write-FileLog -Path $installLog -Text "--- Service creation ---"
+        Write-FileLog -Path $installLog -Text "--- Service registration check ---"
         Write-FileLog -Path $installLog -Text "Service name: $svcName"
-        Write-FileLog -Path $installLog -Text "Executable: $powershellExe"
-        Write-FileLog -Path $installLog -Text "Parameters: $paramStr"
 
-        servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) {
-            throw "servy-cli install failed with exit code $LASTEXITCODE"
+        $existingBackendSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($existingBackendSvc) {
+            Write-Success "Backend update mode: existing service registration kept"
+            Write-FileLog -Path $installLog -Text "Backend update mode: existing service registration preserved"
         }
+        else {
+            Write-Host "    Backend service not found. First-install mode: creating service..." -ForegroundColor Gray
+            servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) {
+                throw "servy-cli install failed with exit code $LASTEXITCODE"
+            }
 
-        if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
-            throw "Service '$svcName' was not created by servy-cli"
+            if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
+                throw "Service '$svcName' was not created by servy-cli"
+            }
+
+            sc.exe config "$svcName" start= delayed-auto 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to configure service '$svcName' for automatic startup"
+            }
+            sc.exe failure "$svcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1 | Add-FileLog -Path $installLog
+            sc.exe failureflag "$svcName" 1 2>&1 | Add-FileLog -Path $installLog
+
+            Write-Success "Backend install mode: service created"
         }
-        sc.exe config "$svcName" start= delayed-auto 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to configure service '$svcName' for automatic startup"
-        }
-        sc.exe failure "$svcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service '$svcName'" }
-        sc.exe failureflag "$svcName" 1 2>&1 | Add-FileLog -Path $installLog
-        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service '$svcName'" }
-        Write-FileLog -Path $installLog -Text "Service $svcName startup type set to Automatic (Delayed Start)"
-        Write-FileLog -Path $installLog -Text "Service $svcName recovery actions configured"
-        Write-FileLog -Path $installLog -Text "Service $svcName installed/updated"
-        Write-Success "Service updated: $svcName"
 
         # --- 8. Start service and verify health endpoint ---
         Write-Host "    Starting backend service to verify..." -ForegroundColor Gray
@@ -2102,13 +2428,28 @@ catch {
         Write-Host "    Backend service verified" -ForegroundColor Gray
         Write-FileLog -Path $installLog -Text "Backend verification complete"
 
+        $activeBackendCommit = (& git -C $repoDir rev-parse HEAD 2>$null | Select-Object -First 1)
+        if ($activeBackendCommit) {
+            $activeBackendCommit = "$activeBackendCommit".Trim()
+            Register-SuccessfulComponentDeployment -Config $Config -Component "backend" -Commit $activeBackendCommit
+            Write-Success "Backend active version: $activeBackendCommit"
+            Write-FileLog -Path $installLog -Text "Backend active version: $activeBackendCommit"
+        }
+
         $script:installedComponents += "backend"
         Write-Log "Backend installed/updated successfully on port $appPort"
         return $true
 
     } catch {
-        Write-Err "Backend setup failed: $_"
-        Write-Log "Backend installation failed: $_" -Level "ERROR"
+        $backendInstallError = $_
+        Write-Err "Backend setup failed: $backendInstallError"
+        Write-Log "Backend installation failed: $backendInstallError" -Level "ERROR"
+        if (-not [string]::IsNullOrWhiteSpace($oldGoodBackend)) {
+            Write-Warn "Backend candidate failed. Restoring known-good commit: $oldGoodBackend"
+            Invoke-BackendRollbackToCommit -Config $Config -Commit $oldGoodBackend | Out-Null
+        } else {
+            Write-Warn "Failed first backend install was not recorded as a deployment version."
+        }
         return $false
     }
 }
@@ -2158,7 +2499,11 @@ function Install-Caddy {
         $caddyDir = Join-Path $Config.InstallRoot "caddy"
         New-Item -Path $caddyDir -ItemType Directory -Force | Out-Null
         $caddyExe = Join-Path $caddyDir "caddy.exe"
-        Save-CaddyRollbackPoint -Config $Config -LogPath $caddyInstallLog
+        Initialize-CaddyLocalGit -Config $Config
+        $oldGoodCaddy = Get-DeploymentComponentCurrent -Config $Config -Component "caddy"
+        if ([string]::IsNullOrWhiteSpace($oldGoodCaddy)) {
+            $oldGoodCaddy = Get-GitHead -RepoDir $caddyDir
+        }
 
         if (-not (Test-Path $caddyExe)) {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -2359,38 +2704,22 @@ $env:CADDY_PORT = "$proxyPort"
         Write-FileLog -Path $caddyInstallLog -Text "Runner script: $runnerScript"
         Write-FileLog -Path $caddyInstallLog -Text "Caddyfile: $caddyfilePath"
 
-        # Unregister old service (process already stopped above)
-        Write-Host "    Unregistering old service definition..." -ForegroundColor Gray
-        $uninstallResult = servy-cli uninstall --name="$caddySvcName" --quiet 2>&1
-        if ($uninstallResult) {
-            Write-FileLog -Path $caddyInstallLog -Text "Uninstall output: $uninstallResult"
+        # Keep the same service registration on update.
+        $existingCaddySvc = Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue
+        if (-not $existingCaddySvc) {
+            Write-Host "    First install: registering Caddy service..." -ForegroundColor Gray
+            $installResult = servy-cli install --name="$caddySvcName" --path="$powershellExe" --params="$paramStr" 2>&1
+            Write-FileLog -Path $caddyInstallLog -Text "servy-cli install output: $installResult"
+            if (-not (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue)) {
+                throw "Service '$caddySvcName' was not created by servy-cli"
+            }
+            sc.exe config $caddySvcName start= delayed-auto | Out-Null
+            sc.exe failure $caddySvcName reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
+            sc.exe failureflag $caddySvcName 1 | Out-Null
+            Write-Success "Caddy service created"
+        } else {
+            Write-Success "Caddy update mode: existing service registration kept"
         }
-        Start-Sleep -Milliseconds 500
-
-        Write-Host "    Registering new Caddy service..." -ForegroundColor Gray
-        $installResult = servy-cli install --name="$caddySvcName" --path="$powershellExe" --params="$paramStr" 2>&1
-        Write-FileLog -Path $caddyInstallLog -Text "servy-cli install output: $installResult"
-
-        if (-not (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue)) {
-            # servy-cli failed silently - try to get more info
-            Write-FileLog -Path $caddyInstallLog -Text "ERROR: servy-cli did not create the service"
-            $svcCheck = sc.exe query $caddySvcName 2>&1 | Out-String
-            Write-FileLog -Path $caddyInstallLog -Text "sc query result: $svcCheck"
-            throw "Service '$caddySvcName' was not created by servy-cli"
-        }
-        $scResult = sc.exe config $caddySvcName start= delayed-auto 2>&1
-        Write-FileLog -Path $caddyInstallLog -Text "sc.exe delayed-auto config: $scResult"
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to configure service '$caddySvcName' for automatic startup"
-        }
-        $scRecoveryResult = sc.exe failure $caddySvcName reset= 86400 actions= restart/5000/restart/15000/restart/60000 2>&1
-        Write-FileLog -Path $caddyInstallLog -Text "sc.exe recovery config: $scRecoveryResult"
-        if ($LASTEXITCODE -ne 0) { throw "Failed to configure recovery actions for service '$caddySvcName'" }
-        $scFailureFlagResult = sc.exe failureflag $caddySvcName 1 2>&1
-        Write-FileLog -Path $caddyInstallLog -Text "sc.exe failureflag config: $scFailureFlagResult"
-        if ($LASTEXITCODE -ne 0) { throw "Failed to enable non-crash recovery for service '$caddySvcName'" }
-        Write-Success "Caddy service installed."
-        Write-FileLog -Path $caddyInstallLog -Text "Service created successfully by servy-cli"
 
         # ---- Start the Caddy service and verify it runs ----
         Write-Host "    Starting Caddy service..." -ForegroundColor Gray
@@ -2491,284 +2820,396 @@ $env:CADDY_PORT = "$proxyPort"
             throw $startError
         }
 
+        $caddyCommit = Commit-CaddyLocalVersion -Config $Config -Message "Known-good Caddy configuration $ts"
+        if ([string]::IsNullOrWhiteSpace($caddyCommit)) { throw "Could not create/read local Caddy Git commit." }
+        Register-SuccessfulComponentDeployment -Config $Config -Component "caddy" -Commit $caddyCommit
+
         $script:installedComponents += "caddy"
         Write-Success "Caddy installed: proxy=$($Config.CaddyPort), admin=$($Config.CaddyAdminPort)"
         Write-Log "Caddy installed successfully: proxy=$($Config.CaddyPort), admin=$($Config.CaddyAdminPort)"
         return $true
     } catch {
-        Write-Err "Caddy setup failed: $_"
-        Write-Log "Caddy installation failed: $_" -Level "ERROR"
+        $caddyInstallError = $_
+        Write-Err "Caddy setup failed: $caddyInstallError"
+        Write-Log "Caddy installation failed: $caddyInstallError" -Level "ERROR"
+        if (-not [string]::IsNullOrWhiteSpace($oldGoodCaddy)) {
+            Write-Warn "Caddy candidate failed. Restoring known-good local Git commit: $oldGoodCaddy"
+            Invoke-CaddyRollbackToCommit -Config $Config -Commit $oldGoodCaddy | Out-Null
+        } else {
+            Write-Warn "Failed first Caddy install was not recorded as a deployment version."
+        }
         return $false
     }
 }
 
 # ===========================================================
-# FRONTEND RELEASES (symlink management)
+# GIT COMMIT ROLLBACK
 # ===========================================================
 
-function Show-ReleaseHistory {
-    param($Config, [string]$AppName = "frontend")
-    $relDir = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "releases"
-    $curLink = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "current"
+function Invoke-FrontendRollbackToCommit {
+    param($Config, [Parameter(Mandatory=$true)][string]$Commit)
 
-    if (-not (Test-Path $relDir)) {
-        Write-Warn "No releases found for '$AppName'."
-        return
-    }
+    $appDir = Join-Path $Config.InstallRoot "frontend"
+    $repoDir = Join-Path $appDir "repo"
+    $svcName = Get-DeployServiceName -Config $Config -Component "frontend"
 
-    $currentTarget = if (Test-Path $curLink) {
-        try { (Get-Item $curLink -ErrorAction Stop).Target } catch { $null }
-    } else { $null }
-
-    $releases = Get-ChildItem -Path $relDir -Directory | Sort-Object Name -Descending
-
-    if ($releases.Count -eq 0) {
-        Write-Warn "No releases found for '$AppName'."
-        return
-    }
-
-    Write-Host ""
-    Write-Host "=== $AppName Release History ($($releases.Count) total) ===" -ForegroundColor Cyan
-    Write-Host ""
-    foreach ($r in $releases) {
-        $marker = if ($currentTarget -and $r.FullName -eq $currentTarget) { "  ← CURRENT" } else { "" }
-        $color = if ($marker) { 'Green' } else { 'Gray' }
-        Write-Host "  $($r.Name)$marker" -ForegroundColor $color
-    }
-    Write-Host ""
-    Write-Log "Release history shown for $AppName ($($releases.Count) releases)"
-}
-
-function Invoke-RollbackApp {
-    param($Config, [string]$AppName = "frontend")
-
-    $relDir  = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "releases"
-    $curLink = Join-Path (Join-Path (Join-Path $Config.InstallRoot $AppName) "webroot") "current"
-    $svcName = Get-DeployServiceName -Config $Config -Component $AppName
-
-    if (-not (Test-Path $relDir)) {
-        Write-Warn "No releases found for '$AppName'."
-        return $false
-    }
-
-    $releases = Get-ChildItem -Path $relDir -Directory | Sort-Object Name -Descending
-    if ($releases.Count -lt 2) {
-        Write-Warn "Need at least 2 releases to rollback '$AppName'."
-        return $false
-    }
-
-    $currentTarget = if (Test-Path $curLink) {
-        try { (Get-Item $curLink -ErrorAction Stop).Target } catch { $null }
-    } else { $null }
-
-    # Previous release = most recent non-current
-    $targetRelease = $releases | Where-Object { $_.FullName -ne $currentTarget } | Select-Object -First 1
-
-    if (-not $targetRelease) {
-        Write-Warn "No previous release found to rollback to."
-        return $false
-    }
-
-    Write-Step "Rolling back ${AppName}: $($(Split-Path $currentTarget -Leaf)) \u2192 $($targetRelease.Name)"
-
-    if ($script:dryRun) {
-        Write-Warn "[DRY-RUN] Would swap symlink back to $($targetRelease.Name)"
-        return $true
-    }
-
-    Remove-Item $curLink -Force -ErrorAction SilentlyContinue
-    New-Item -ItemType SymbolicLink -Path $curLink -Target $targetRelease.FullName -Force | Out-Null
-    Write-Success "Rolled back $AppName to release: $($targetRelease.Name)"
-    Write-Log "$AppName rolled back to release: $($targetRelease.Name)"
-    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    if ($svc) {
-        Restart-Service -Name $svcName -ErrorAction SilentlyContinue
-        Write-Success "Restarted service: $svcName"
-    }
-    return $true
-}
-
-function Invoke-BackendRollback {
-    param($Config)
-    Write-Step "Rolling back backend"
-
-    $state = Get-RollbackState -Config $Config -Key "backend"
-    if (-not $state -or [string]::IsNullOrWhiteSpace("$($state.Commit)")) {
-        Write-Warn "No backend rollback point found. Run at least one backend update first."
-        return $false
-    }
-
-    $repoDir = "$($state.RepoDir)"
     if (-not (Test-Path (Join-Path $repoDir ".git"))) {
-        Write-Warn "Backend repo not found: $repoDir"
+        Write-Warn "Frontend repo not found."
         return $false
     }
-
-    if ($script:dryRun) {
-        Write-Warn "[DRY-RUN] Would reset backend repo to $($state.Commit), refresh requirements, restart service, and verify health."
-        return $true
-    }
-
-    $svcName = Get-DeployServiceName -Config $Config -Component "backend"
-    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
 
     try {
+        $currentCommit = Get-GitHead -RepoDir $repoDir
+        if ($currentCommit -eq $Commit) {
+            Write-Success "Frontend already at rollback target: $Commit"
+        }
+
+        $dependencyChanged = $true
+        if (-not [string]::IsNullOrWhiteSpace($currentCommit)) {
+            & git -C $repoDir diff --quiet $currentCommit $Commit -- package.json package-lock.json 2>$null
+            $dependencyChanged = ($LASTEXITCODE -ne 0)
+        }
+
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -ne 'Stopped') {
-            Write-Host "    Stopping backend service..." -ForegroundColor Gray
-            Stop-Service -Name $svcName -ErrorAction Stop
-            Start-Sleep -Seconds 3
+            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
         }
 
-        Write-Host "    Restoring backend commit $($state.Commit)..." -ForegroundColor Gray
-        & git -C $repoDir reset --hard "$($state.Commit)"
-        if ($LASTEXITCODE -ne 0) {
-            throw "git reset failed with exit code $LASTEXITCODE"
+        if (-not (Ensure-GitCommitAvailable -RepoDir $repoDir -Commit $Commit)) {
+            throw "Frontend rollback commit is not available locally and could not be fetched: $Commit"
         }
 
-        # Keep the existing .env/secrets, but make the Python environment compatible
-        # with the restored commit in case requirements.txt changed.
-        $pythonExe = Join-Path $repoDir "venv\Scripts\python.exe"
-        $requirements = Join-Path $repoDir "requirements.txt"
-        if ((Test-Path $pythonExe) -and (Test-Path $requirements)) {
-            Write-Host "    Synchronizing backend dependencies for restored commit..." -ForegroundColor Gray
-            & $pythonExe -m pip install --no-cache-dir -r $requirements
-            if ($LASTEXITCODE -ne 0) {
-                throw "pip install for rollback requirements failed with exit code $LASTEXITCODE"
+        Write-Host "    Resetting frontend Git to: $Commit" -ForegroundColor Gray
+        git -C $repoDir reset --hard $Commit | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Frontend git reset failed." }
+
+        Push-Location $repoDir
+        try {
+            if ($dependencyChanged) {
+                Write-Host "    Frontend dependency files changed; synchronizing node_modules..." -ForegroundColor Gray
+                npm install --legacy-peer-deps
+                if ($LASTEXITCODE -ne 0) { throw "Frontend rollback npm dependency sync failed." }
+            } else {
+                Write-Success "Frontend dependencies unchanged; keeping existing node_modules"
             }
-        } else {
-            Write-Warn "Backend venv or requirements.txt is missing. Code was restored, but dependencies were not refreshed."
+
+            $serveMain = Join-Path $repoDir "node_modules\serve\build\main.js"
+            if (-not (Test-Path $serveMain)) {
+                Write-Host "    Local serve package missing; installing it..." -ForegroundColor Gray
+                npm install --no-save serve --legacy-peer-deps
+                if ($LASTEXITCODE -ne 0) { throw "Could not install frontend serve package." }
+            }
+
+            # dist is a generated build artifact, so rebuild it for the target Git commit.
+            $distDir = Join-Path $repoDir "dist"
+            if (Test-Path $distDir) {
+                Remove-Item -Path $distDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+            $env:VITE_API_URL = $Config.ApiPrefix
+            Write-Host "    Rebuilding frontend for rollback target..." -ForegroundColor Gray
+            npm run build
+            if ($LASTEXITCODE -ne 0) { throw "Frontend rollback build failed." }
+        }
+        finally {
+            Pop-Location
         }
 
-        if ($svc) {
-            Write-Host "    Starting backend service..." -ForegroundColor Gray
-            Start-Service -Name $svcName -ErrorAction Stop
-            Start-Sleep -Seconds 3
+        $distDir = Join-Path $repoDir "dist"
+        if (-not (Test-Path $distDir)) {
+            throw "Frontend rollback build completed without creating dist."
+        }
 
-            $healthOk = Test-Endpoint `
+        Start-Service -Name $svcName -ErrorAction Stop
+
+        $ok = Test-Endpoint `
+            -Url "http://127.0.0.1:$($Config.FrontendPort)" `
+            -Name "Frontend" `
+            -TimeoutSec 5 `
+            -Retries 10 `
+            -RetryDelaySec 2
+
+        if (-not $ok) {
+            $logsDir = Join-Path (Join-Path $Config.InstallRoot "logs") "frontend"
+            $latest = Get-ChildItem -Path $logsDir -Filter "frontend_service_*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+
+            if ($latest) {
+                Write-Host ""
+                Write-Host "    --- Frontend service log ---" -ForegroundColor Yellow
+                Get-Content $latest.FullName -ErrorAction SilentlyContinue |
+                    Select-Object -Last 30 |
+                    ForEach-Object { Write-Host "    $_" -ForegroundColor DarkYellow }
+                Write-Host "    --- end log ---" -ForegroundColor Yellow
+            }
+
+            throw "Frontend rollback health check failed."
+        }
+
+        Write-Success "Frontend restored to local Git commit: $Commit"
+        return $true
+    }
+    catch {
+        Write-Err "Frontend rollback failed: $_"
+        return $false
+    }
+}
+
+function Invoke-BackendRollbackToCommit {
+    param($Config, [Parameter(Mandatory=$true)][string]$Commit)
+
+    $appDir = Join-Path $Config.InstallRoot "backend"
+    $repoDir = Join-Path $appDir "repo"
+    $svcName = Get-DeployServiceName -Config $Config -Component "backend"
+
+    if (-not (Test-Path (Join-Path $repoDir ".git"))) {
+        Write-Warn "Backend repo not found."
+        return $false
+    }
+
+    try {
+        $currentCommit = Get-GitHead -RepoDir $repoDir
+
+        if ($currentCommit -eq $Commit) {
+            Write-Success "Backend already at rollback target: $Commit"
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Stopped') {
+                Start-Service -Name $svcName -ErrorAction SilentlyContinue
+            }
+
+            $ok = Test-Endpoint `
                 -Url "http://127.0.0.1:$($Config.BackendPort)$($Config.ApiPrefix)/health" `
                 -Name "Backend API" `
                 -TimeoutSec 5 `
                 -Retries 5 `
                 -RetryDelaySec 2
 
-            if (-not $healthOk) {
-                throw "Backend rollback completed, but health verification failed."
-            }
+            if ($ok) { return $true }
         }
 
-        Write-Success "Backend rolled back to commit: $($state.Commit)"
-        Write-Log "Backend rollback completed: $($state.Commit)"
+        $requirementsChanged = $true
+        if (-not [string]::IsNullOrWhiteSpace($currentCommit)) {
+            & git -C $repoDir diff --quiet $currentCommit $Commit -- requirements.txt 2>$null
+            $requirementsChanged = ($LASTEXITCODE -ne 0)
+        }
+
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Stopped') {
+            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+
+        if (-not (Ensure-GitCommitAvailable -RepoDir $repoDir -Commit $Commit)) {
+            throw "Backend rollback commit is not available locally and could not be fetched: $Commit"
+        }
+
+        Write-Host "    Resetting backend Git to: $Commit" -ForegroundColor Gray
+        git -C $repoDir reset --hard $Commit | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Backend git reset failed." }
+
+        $pythonExe = Join-Path $repoDir "venv\Scripts\python.exe"
+        if (-not (Test-Path $pythonExe)) {
+            throw "Backend venv is missing. Run Install / Update to repair it."
+        }
+
+        if ($requirementsChanged) {
+            $requirements = Join-Path $repoDir "requirements.txt"
+            if (Test-Path $requirements) {
+                Write-Host "    requirements.txt changed; synchronizing backend packages..." -ForegroundColor Gray
+                & $pythonExe -m pip install --no-cache-dir -r $requirements
+                if ($LASTEXITCODE -ne 0) { throw "Backend rollback dependency sync failed." }
+            }
+        } else {
+            Write-Success "Backend requirements unchanged; keeping existing venv packages"
+        }
+
+        Push-Location $repoDir
+        try {
+            & $pythonExe -c "import app.main; print('APP_IMPORT_OK')" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Backend rollback app import failed." }
+        }
+        finally {
+            Pop-Location
+        }
+
+        Start-Service -Name $svcName -ErrorAction Stop
+
+        $ok = Test-Endpoint `
+            -Url "http://127.0.0.1:$($Config.BackendPort)$($Config.ApiPrefix)/health" `
+            -Name "Backend API" `
+            -TimeoutSec 5 `
+            -Retries 7 `
+            -RetryDelaySec 2
+
+        if (-not $ok) { throw "Backend rollback health check failed." }
+
+        Write-Success "Backend restored to local Git commit: $Commit"
         return $true
     }
     catch {
         Write-Err "Backend rollback failed: $_"
-        Write-Log "Backend rollback failed: $_" -Level "ERROR"
         return $false
     }
 }
 
-function Invoke-CaddyRollback {
-    param($Config)
-    Write-Step "Rolling back Caddy"
-    $state = Get-RollbackState -Config $Config -Key "caddy"
-    if (-not $state -or [string]::IsNullOrWhiteSpace("$($state.BackupDir)")) {
-        Write-Warn "No Caddy rollback point found. Run at least one Caddy update first."
-        return $false
-    }
-    if (-not (Test-Path "$($state.BackupDir)")) {
-        Write-Warn "Caddy rollback backup not found: $($state.BackupDir)"
-        return $false
-    }
-    if ($script:dryRun) {
-        Write-Warn "[DRY-RUN] Would restore Caddy config from $($state.BackupDir)"
-        return $true
-    }
+function Invoke-CaddyRollbackToCommit {
+    param($Config, [Parameter(Mandatory=$true)][string]$Commit)
 
+    $caddyDir = Join-Path $Config.InstallRoot "caddy"
     $svcName = Get-DeployServiceName -Config $Config -Component "caddy"
-    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -ne 'Stopped') {
-        Stop-Service -Name $svcName -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
-    }
+    if (-not (Test-Path (Join-Path $caddyDir ".git"))) { Write-Warn "Caddy local Git repo not found."; return $false }
 
-    foreach ($file in @($state.Files)) {
-        Copy-Item -Path (Join-Path "$($state.BackupDir)" "$file") -Destination (Join-Path "$($state.CaddyDir)" "$file") -Force
-    }
+    try {
+        $currentCommit = Get-GitHead -RepoDir $caddyDir
+        if ($currentCommit -eq $Commit) {
+            Write-Success "Caddy already at rollback target: $Commit"
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Stopped') {
+                Start-Service -Name $svcName -ErrorAction SilentlyContinue
+            }
+            $ok = Test-Endpoint -Url "http://127.0.0.1:$($Config.CaddyPort)$($Config.ApiPrefix)/health" -Name "Caddy proxy" -TimeoutSec 5 -Retries 5 -RetryDelaySec 2
+            if ($ok) { return $true }
+        }
 
-    if ($svc) {
-        Start-Service -Name $svcName -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 5
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Stopped') { Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
+
+        & git -C $caddyDir cat-file -e "$Commit^{commit}" 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "Caddy local rollback commit not found: $Commit" }
+
+        git -C $caddyDir reset --hard $Commit | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Caddy git reset failed." }
+
+        $caddyExe = Join-Path $caddyDir "caddy.exe"
+        $caddyfile = Join-Path $caddyDir "Caddyfile"
+        $env:CADDY_PORT = "$($Config.CaddyPort)"
+        $env:CADDY_ADMIN = "127.0.0.1:$($Config.CaddyAdminPort)"
+        & $caddyExe validate --config $caddyfile | Out-Null
+        $valid = $LASTEXITCODE
+        Remove-Item Env:\CADDY_PORT -ErrorAction SilentlyContinue
+        Remove-Item Env:\CADDY_ADMIN -ErrorAction SilentlyContinue
+        if ($valid -ne 0) { throw "Rolled-back Caddyfile is invalid." }
+
+        Start-Service -Name $svcName -ErrorAction Stop
+        $ok = Test-Endpoint -Url "http://127.0.0.1:$($Config.CaddyPort)$($Config.ApiPrefix)/health" -Name "Caddy proxy" -TimeoutSec 5 -Retries 7 -RetryDelaySec 2
+        if (-not $ok) { throw "Caddy rollback health check failed." }
+
+        Write-Success "Caddy restored to local Git commit: $Commit"
+        return $true
+    } catch {
+        Write-Err "Caddy rollback failed: $_"
+        return $false
     }
-    Write-Success "Caddy config rolled back from: $($state.BackupDir)"
-    return $true
 }
 
 function Invoke-SelectedRollback {
-    param($Config, [Parameter(Mandatory=$true)][string]$Key)
+    param(
+        $Config,
+        [Parameter(Mandatory=$true)][string]$Key,
+        [Parameter(Mandatory=$true)][string]$Commit
+    )
     switch ($Key) {
-        "frontend" { return Invoke-RollbackApp -Config $Config -AppName "frontend" }
-        "backend"  { return Invoke-BackendRollback -Config $Config }
-        "caddy"    { return Invoke-CaddyRollback -Config $Config }
+        "frontend" { return Invoke-FrontendRollbackToCommit -Config $Config -Commit $Commit }
+        "backend"  { return Invoke-BackendRollbackToCommit -Config $Config -Commit $Commit }
+        "caddy"    { return Invoke-CaddyRollbackToCommit -Config $Config -Commit $Commit }
         default    { Write-Warn "Unknown rollback component: $Key"; return $false }
     }
 }
 
 function Show-RollbackMenu {
     param($Config)
-    Write-Host ""
-    Write-Host " A) Rollback everything" -ForegroundColor White
-    foreach ($c in Get-Components -Config $Config) {
-        Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Gray
-    }
-    Write-Host " H) Frontend release history" -ForegroundColor Gray
-    Write-Host " B) Back" -ForegroundColor Gray
-    $sub = Read-Host "`nSelect rollback option"
 
-    if ($sub -match '^[Aa]$') {
-        if (Confirm-Step "Rollback all components?" -DefaultYes:$false) {
-            $ok = $true
-            foreach ($key in @("frontend", "backend", "caddy")) {
-                if (-not (Invoke-SelectedRollback -Config $Config -Key $key)) { $ok = $false }
-            }
-            if ($ok) {
-                Verify-Health -Config $Config | Out-Null
-                Write-Success "Rollback all completed."
-            } else {
-                Write-Warn "Rollback all finished with warnings. Check messages above."
-            }
-        }
-    } elseif ($sub -match '^[Hh]$') {
-        Show-ReleaseHistory -Config $Config -AppName "frontend"
-    } elseif ($sub -match '^\d+$') {
-        $c = Get-Components -Config $Config | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
-        if ($c -and (Confirm-Step "Rollback $($c.Display)?" -DefaultYes:$false)) {
-            Invoke-SelectedRollback -Config $Config -Key $c.Key | Out-Null
+    $state = Get-DeploymentState -Config $Config
+    if (-not $state -or -not $state.deploymentVersions -or @($state.deploymentVersions).Count -lt 2) {
+        Write-Warn "No previous complete deployment version is available yet."
+        return
+    }
+
+    $versions = @($state.deploymentVersions)
+    $current = $versions[0]
+    $target = $versions[1]
+
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " Rollback Complete Deployment" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " Current : $($current.versionName)" -ForegroundColor Green
+    Write-Host " Previous: $($target.versionName)" -ForegroundColor Gray
+    Write-Host ""
+
+    foreach ($key in @("frontend","backend","caddy")) {
+        Write-Host " $key" -ForegroundColor White
+        Write-Host "   current target : $($current.components.$key.current)" -ForegroundColor Green
+        Write-Host "   rollback target: $($target.components.$key.current)" -ForegroundColor Gray
+    }
+
+    Write-Host ""
+    if (-not (Confirm-Step "Rollback complete deployment $($current.versionName) -> $($target.versionName)?" -DefaultYes:$false)) {
+        return
+    }
+
+    $restored = @()
+    $ok = $true
+
+    foreach ($key in @("caddy","backend","frontend")) {
+        $commit = "$($target.components.$key.current)".Trim()
+        if ([string]::IsNullOrWhiteSpace($commit)) { continue }
+
+        if (Invoke-SelectedRollback -Config $Config -Key $key -Commit $commit) {
+            $restored += $key
+        } else {
+            $ok = $false
+            break
         }
     }
+
+    if (-not $ok) {
+        Write-Warn "Rollback did not complete. Restoring the original current deployment where possible..."
+        foreach ($key in @("caddy","backend","frontend")) {
+            if ($restored -notcontains $key) { continue }
+            $commit = "$($current.components.$key.current)".Trim()
+            if (-not [string]::IsNullOrWhiteSpace($commit)) {
+                Invoke-SelectedRollback -Config $Config -Key $key -Commit $commit | Out-Null
+            }
+        }
+        Write-Err "Complete deployment rollback failed. Deployment state file was not changed."
+        return
+    }
+
+    # Swap current/previous full deployments so rollback can be undone.
+    $state.deploymentVersions = @($target, $current)
+    Save-DeploymentState -Config $Config -State $state
+    Write-Success "Complete deployment rollback successful. Current: $($target.versionName)"
 }
 
-# ===========================================================
-# ROLLBACK (full deployment failure)
-# ===========================================================
 function Invoke-Rollback {
     param($Config)
-    if ($script:installedComponents.Count -eq 0) { return }
-    Write-Step "ROLLING BACK installed components"
-    Write-Log "Rollback started" -Level "WARN"
-    # Roll back in reverse install order
-    [array]::Reverse($script:installedComponents)
-    foreach ($key in $script:installedComponents) {
-        Write-Warn "Rolling back: $key"
-        Remove-Component -Key $key -Config $Config -DeleteFiles
-        Write-Log "Rolled back: $key" -Level "WARN"
+
+    if (-not $script:deploymentStateBeforeRun) {
+        Write-Warn "No previous successful deployment state exists for transactional rollback."
+        return $false
     }
-    $script:installedComponents = @()
-    Write-Warn "Rollback complete."
+
+    $previous = @($script:deploymentStateBeforeRun.deploymentVersions)[0]
+    if (-not $previous) { return $false }
+
+    Write-Step "RESTORING previous known-good deployment"
+    $ok = $true
+    foreach ($key in @("caddy","backend","frontend")) {
+        $commit = "$($previous.components.$key.current)".Trim()
+        if ([string]::IsNullOrWhiteSpace($commit)) { continue }
+        if (-not (Invoke-SelectedRollback -Config $Config -Key $key -Commit $commit)) { $ok = $false }
+    }
+
+    if ($ok) {
+        Save-DeploymentState -Config $Config -State $script:deploymentStateBeforeRun
+        Write-Success "Previous known-good deployment restored."
+    }
+    return $ok
 }
 
-# ===========================================================
-# COMPONENT REGISTRY / DISPATCH
-# ===========================================================
 function Get-Components {
     param($Config)
     return @(
@@ -2794,6 +3235,9 @@ function Invoke-ComponentInstall {
             if (-not $secrets) {
                 Write-Warn "Backend installation cancelled - no valid credentials."
                 Write-Log "Backend install cancelled: no secrets" -Level "WARN"
+                return $false
+            }
+            if (-not (Confirm-DeploymentCredentials -Config $Config -Secrets $secrets)) {
                 return $false
             }
             $result = Install-Backend -Config $Config -Secrets $secrets
@@ -2905,6 +3349,19 @@ function Remove-Component {
         Write-Warn "[DRY-RUN] Would remove $Key service and $(if($DeleteFiles){'delete'}else{'keep'}) its files"
         Write-FileLog -Path $uninstallLog -Text "[DRY-RUN] Would uninstall $Key"
     }
+    # If component files were deleted, remove it from the current deployment state.
+    if ($DeleteFiles -and -not $script:dryRun) {
+        $state = Get-DeploymentState -Config $Config
+        if ($state -and $state.deploymentVersions -and @($state.deploymentVersions).Count -gt 0) {
+            $current = @($state.deploymentVersions)[0]
+            if ($current.components.$Key) {
+                $current.components.$Key.current = $null
+                $current.components.$Key.previous = $null
+                Save-DeploymentState -Config $Config -State $state
+            }
+        }
+    }
+
     Write-Log "Component removed: $Key"
 }
 
@@ -3009,6 +3466,11 @@ function Show-Status {
 function Invoke-FullDeploy {
     param($Config)
 
+    $script:deploymentTransaction = $true
+    $script:deploymentCandidates = @{}
+    $script:liveComponentsChanged = @()
+    $script:deploymentStateBeforeRun = Copy-ObjectDeep -Object (Get-DeploymentState -Config $Config)
+
     # 1. Validate install drive exists (prompt already happened at entry)
     $drive = [System.IO.Path]::GetPathRoot($Config.InstallRoot)
     if (-not (Test-Path $drive)) {
@@ -3055,25 +3517,32 @@ function Invoke-FullDeploy {
     $allSucceeded = $true
 
     # --- Credentials: resolve once upfront ---
+    # This happens before any component Git/service changes.
     $secrets = $null
     if ($targetComponents -contains "backend") {
         Write-Step "Checking deployment credentials"
         $secrets = Get-SecretsOrInitialize
         if (-not $secrets) {
-            Write-Warn "Returning to main menu."
+            Write-Warn "Deployment cancelled before component update started."
+            $script:deploymentTransaction = $false
+            return
+        }
+
+        if (-not (Confirm-DeploymentCredentials -Config $Config -Secrets $secrets)) {
+            $script:deploymentTransaction = $false
             return
         }
     }
 
-    Write-Step "Installing components"
+    Write-Step "Installing / updating selected components"
 
     if ($targetComponents -contains "frontend") {
         Write-Host "  Frontend (port $($Config.FrontendPort))..." -ForegroundColor Gray
-        Start-Spinner "Installing Frontend ..."
+        Start-Spinner "Frontend deployment ..."
         $frontendOk = Install-Frontend -Config $Config
         Stop-Spinner
         if ($frontendOk) {
-            Write-Success "Frontend installed on port $($Config.FrontendPort)"
+            Write-Success "Frontend ready on port $($Config.FrontendPort)"
             Write-Log "Frontend installed on port $($Config.FrontendPort)"
         } else {
             Write-Err "Frontend installation FAILED — skipping remaining components"
@@ -3085,11 +3554,11 @@ function Invoke-FullDeploy {
         # Backend install function now safely stops/uninstalls any existing backend service
         # and kills stale backend Python processes before replacing repo/venv.
         Write-Host "  Backend (port $($Config.BackendPort))..." -ForegroundColor Gray
-        Start-Spinner "Installing Backend ..."
+        Start-Spinner "Backend deployment ..."
         $backendOk = Install-Backend -Config $Config -Secrets $secrets
         Stop-Spinner
         if ($backendOk) {
-            Write-Success "Backend installed on port $($Config.BackendPort)"
+            Write-Success "Backend ready on port $($Config.BackendPort)"
             Write-Log "Backend installed on port $($Config.BackendPort)"
         } else {
             Write-Err "Backend installation FAILED — skipping remaining components"
@@ -3099,11 +3568,11 @@ function Invoke-FullDeploy {
 
     if ($allSucceeded -and $targetComponents -contains "caddy") {
         Write-Host "  Caddy reverse proxy (port $($Config.CaddyPort))..." -ForegroundColor Gray
-        Start-Spinner "Installing Caddy ..."
+        Start-Spinner "Caddy deployment ..."
         $caddyOk = Install-Caddy -Config $Config
         Stop-Spinner
         if ($caddyOk) {
-            Write-Success "Caddy installed on port $($Config.CaddyPort)"
+            Write-Success "Caddy ready on port $($Config.CaddyPort)"
             Write-Log "Caddy installed on port $($Config.CaddyPort)"
         } else {
             Write-Err "Caddy installation FAILED — skipping remaining components"
@@ -3111,23 +3580,49 @@ function Invoke-FullDeploy {
         }
     }
 
-    # Roll back on failure (only in non-dry-run mode)
+    # Automatic transactional recovery on failure.
+    # If failure happened before any live component changed, do NOT touch services.
     if (-not $allSucceeded -and -not $script:dryRun) {
-        if ($script:headless -or (Confirm-Step "Some components failed. Roll back installed components?" -DefaultYes:$true)) {
-            Invoke-Rollback -Config $Config
-            Write-Log "Deployment rolled back due to failures" -Level "ERROR"
-            return
+        Write-Host ""
+        Write-Err "UPDATE FAILED"
+
+        if (@($script:liveComponentsChanged).Count -eq 0) {
+            Write-Success "No live component was changed."
+            Write-Success "Current known-good deployment remains active."
+            Write-Success "No failed candidate was saved as a deployment version."
+            Write-Log "Deployment failed before live promotion; no rollback required" -Level "ERROR"
         }
+        else {
+            Write-Warn "A live component had already changed. Automatically restoring the saved current known-good deployment..."
+            $restoreOk = Invoke-Rollback -Config $Config
+
+            if ($restoreOk) {
+                $active = Get-CurrentDeploymentVersion -Config $Config
+                if ($active) {
+                    Write-Success "Active deployment restored: $($active.versionName)"
+                } else {
+                    Write-Success "Previous known-good deployment restored."
+                }
+                Write-Success "No failed candidate was saved as a deployment version."
+                Write-Log "Deployment failed after live promotion; previous known-good deployment restored automatically" -Level "ERROR"
+            } else {
+                Write-Err "Automatic recovery could not fully verify the previous deployment."
+                Write-Warn "deployment-state.json was not promoted to the failed candidate."
+                Write-Log "Deployment failed after live promotion; automatic recovery was incomplete" -Level "ERROR"
+            }
+        }
+
+        $script:deploymentTransaction = $false
+        return
     }
 
-    # Start services and verify
-    if (Confirm-Step "Start all installed services now?") {
-        Start-AllServices -Config $Config
-        if (-not $script:dryRun) {
-            Start-Sleep -Seconds 5
-            Verify-Health -Config $Config
-        }
+    # Each component already starts and health-checks itself.
+    # Promote the full deployment only after every selected component succeeded.
+    if ($allSucceeded -and -not $script:dryRun) {
+        Complete-FullDeploymentState -Config $Config
     }
+
+    $script:deploymentTransaction = $false
 
     # Summary
     if ($script:dryRun) {
@@ -3178,25 +3673,40 @@ function Invoke-FullDeploy {
 function Show-MainMenu {
     param($Config)
     Clear-Host
+
+    $anyInstalled = Test-AnyComponentInstalled -Config $Config
+    $allInstalled = Test-AllComponentsInstalled -Config $Config
+    $installUpdateLabel = if (-not $anyInstalled) {
+        "Install complete deployment"
+    } else {
+        "Update complete deployment"
+    }
+
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host " Servy Full-Stack Deployment Manager" -ForegroundColor Cyan
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host " Environment: $(Get-DeployEnvironment -Config $Config)" -ForegroundColor Gray
-    if ([string]::IsNullOrWhiteSpace($Config.InstallRoot)) {
-        Write-Host " [!] Install path: NOT SET - restart the script to set it" -ForegroundColor Red
-    } else {
+    if (-not [string]::IsNullOrWhiteSpace($Config.InstallRoot)) {
         Write-Host " Install path: $($Config.InstallRoot)" -ForegroundColor Gray
     }
+
+    $currentVersion = Get-CurrentDeploymentVersion -Config $Config
+    if ($currentVersion) {
+        Write-Host " Deployment: $($currentVersion.versionName)" -ForegroundColor Green
+    }
+
     Write-Host ""
     Write-Host "  1) Check prerequisites" -ForegroundColor White
-    Write-Host "  2) Install / update components" -ForegroundColor White
-    Write-Host "  3) Uninstall components" -ForegroundColor White
+    Write-Host "  2) $installUpdateLabel" -ForegroundColor White
+    Write-Host "  3) Uninstall complete deployment" -ForegroundColor White
     Write-Host "  4) Service status / health check" -ForegroundColor White
     Write-Host "  5) Start services" -ForegroundColor White
     Write-Host "  6) Stop services" -ForegroundColor White
     Write-Host "  7) Caddy network config" -ForegroundColor White
     Write-Host "  8) Open logs folder" -ForegroundColor White
-    Write-Host "  9) Rollback deployment" -ForegroundColor White
+    if (Test-DeploymentRollbackAvailable -Config $Config) {
+        Write-Host "  9) Rollback deployment" -ForegroundColor White
+    }
     Write-Host "  Q) Quit" -ForegroundColor White
     Write-Host ""
 }
@@ -3527,107 +4037,95 @@ do {
             Test-Prerequisites | Out-Null
         }
         "^2$" {
-            # Install components - sub-prompt
-            $compList = Get-Components -Config $Config
+            $state = Get-DeploymentState -Config $Config
+            $currentVersion = $null
+            $nextVersion = "v1"
+
+            if ($state -and $state.deploymentVersions -and @($state.deploymentVersions).Count -gt 0) {
+                $currentVersion = @($state.deploymentVersions)[0].versionName
+                $nextVersion = Get-NextDeploymentVersionName -State $state
+            }
+
             Write-Host ""
-            Write-Host " A) Install everything (full deployment)" -ForegroundColor White
-            foreach ($c in $compList) {
-                $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
-                if ($svc -and $svc.Status -eq 'Running') {
-                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
-                    Write-Host "  [RUNNING]" -ForegroundColor Green
-                } elseif ($svc) {
-                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Gray -NoNewline
-                    Write-Host "  [STOPPED]" -ForegroundColor DarkYellow
-                } else {
-                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray
-                }
+            if ($currentVersion) {
+                Write-Host " Current deployment: $currentVersion" -ForegroundColor Green
+                Write-Host " Next deployment:    $nextVersion" -ForegroundColor Cyan
+                Write-Host " Checking all component Git repositories..." -ForegroundColor Gray
+            } else {
+                Write-Host " First deployment: v1" -ForegroundColor Cyan
+                Write-Host " Installing complete deployment..." -ForegroundColor Gray
             }
-            Write-Host "  B) Back" -ForegroundColor Gray
-            $sub = Read-Host "`nSelect to install"
-            if ($sub -match '^[Aa]$') {
-                Invoke-FullDeploy -Config $Config
-            } elseif ($sub -match '^\d+$') {
-                $c = $compList | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
-                if ($c -and (Confirm-Step "Install $($c.Display)?")) {
-                    Initialize-Logger -Config $Config
-                    $installOk = Invoke-ComponentInstall -Key $c.Key -Config $Config
-                    if (-not $installOk) {
-                        Write-Host ""
-                        Write-Warn "$($c.Display) installation was cancelled or failed."
-                    }
-                }
-            }
+
+            Invoke-FullDeploy -Config $Config
         }
         "^3$" {
-            # Uninstall components - sub-prompt
+            # Complete uninstall only.
+            # Install/update/rollback/uninstall all operate on the whole deployment.
             $compList = Get-Components -Config $Config
+
             Write-Host ""
-            Write-Host " A) Uninstall everything" -ForegroundColor White
-            foreach ($c in $compList) {
-                $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
-                if ($svc -and $svc.Status -eq 'Running') {
-                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Green -NoNewline
-                    Write-Host "  [RUNNING]" -ForegroundColor Green
-                } elseif ($svc) {
-                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor Gray -NoNewline
-                    Write-Host "  [STOPPED]" -ForegroundColor DarkYellow
-                } else {
-                    Write-Host " $($c.Num)) $($c.Display)" -ForegroundColor DarkGray -NoNewline
-                    Write-Host "  [NOT INSTALLED]" -ForegroundColor DarkGray
-                }
+            Write-Host "============================================" -ForegroundColor Cyan
+            Write-Host " Uninstall Complete Deployment" -ForegroundColor Cyan
+            Write-Host "============================================" -ForegroundColor Cyan
+            Write-Host " This will remove:" -ForegroundColor Gray
+            Write-Host "   - Frontend service and files" -ForegroundColor Gray
+            Write-Host "   - Backend service and files" -ForegroundColor Gray
+            Write-Host "   - Caddy service and files" -ForegroundColor Gray
+            Write-Host "   - Logs" -ForegroundColor Gray
+            Write-Host "   - deployment-state.json" -ForegroundColor Gray
+            Write-Host "   - $($Config.InstallRoot)" -ForegroundColor Gray
+            Write-Host ""
+            Write-Host " Persistent face-image storage will be preserved:" -ForegroundColor Green
+            Write-Host "   $(Get-MediaStoragePath -Config $Config)" -ForegroundColor Green
+            Write-Host ""
+
+            $confirm = Read-Host "Type YES to uninstall the complete deployment"
+            if ($confirm -ne "YES") {
+                Write-Warn "Uninstall cancelled."
+                break
             }
-            Write-Host " B) Back" -ForegroundColor Gray
-            $sub = Read-Host "`nSelect to uninstall"
-            if ($sub -match '^[Aa]$') {
-                # Uninstall all
-                Write-Step "Currently installed services"
-                $anyInstalled = $false
-                foreach ($c in $compList) {
-                    $svc = Get-Service -Name $c.Service -ErrorAction SilentlyContinue
-                    if ($svc) { $anyInstalled = $true }
+
+            Initialize-Logger -Config $Config
+
+            # Remove all services + component folders.
+            foreach ($c in $compList) {
+                Remove-Component -Key $c.Key -Config $Config -DeleteFiles
+            }
+
+            # Final cleanup of deployment state/logs/install root.
+            if (-not (Test-AppInstallRoot -Config $Config)) {
+                Write-Warn "InstallRoot does not look like an ESS app folder. Skipping root-folder deletion: $($Config.InstallRoot)"
+                break
+            }
+
+            $statePath = Get-DeploymentStatePath -Config $Config
+            if (Test-Path $statePath) {
+                Remove-Item -Path $statePath -Force -ErrorAction SilentlyContinue
+                Write-Success "Deleted deployment-state.json"
+            }
+
+            $logsPath = Join-Path $Config.InstallRoot "logs"
+            if (Test-Path $logsPath) {
+                Remove-Item -Path $logsPath -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Success "Deleted logs/ folder"
+            }
+
+            if (Test-Path $Config.InstallRoot) {
+                try {
+                    Remove-Item -Path $Config.InstallRoot -Recurse -Force -ErrorAction Stop
+                    Write-Success "Deleted app folder: $($Config.InstallRoot)"
                 }
-                if (-not $anyInstalled) {
-                    Write-Warn "No services are currently installed. Nothing to uninstall."
-                } else {
-                    $confirm = Read-Host "`nThis will remove ALL installed services. Type YES to confirm"
-                    if ($confirm -eq "YES") {
-                        # Remove all component services and their folders first
-                        $delFiles = (Read-Host "Delete component files (frontend/, backend/, caddy/)? (y/N)") -match '^[Yy]'
-                        foreach ($c in $compList) {
-                            Remove-Component -Key $c.Key -Config $Config -DeleteFiles:$delFiles
-                        }
-                        # Then ask about logs and the app folder only. Persistent storage is outside InstallRoot.
-                        if ($delFiles -and (Confirm-Step "Delete logs/ folder and app folder $($Config.InstallRoot) too? Storage is preserved." -DefaultYes:$false)) {
-                            $logsPath = Join-Path $Config.InstallRoot "logs"
-                            if (Test-Path $logsPath) {
-                                Remove-Item $logsPath -Recurse -Force -ErrorAction SilentlyContinue
-                                Write-Success "Deleted logs/ folder"
-                            }
-                            if ((Test-Path $Config.InstallRoot) -and (Test-AppInstallRoot -Config $Config)) {
-                                # Only delete root if it's empty (after removing component + logs folders)
-                                $remaining = Get-ChildItem $Config.InstallRoot -ErrorAction SilentlyContinue
-                                if (-not $remaining) {
-                                    Remove-Item $Config.InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
-                                    Write-Success "Deleted app folder: $($Config.InstallRoot)"
-                                } else {
-                                    Write-Warn "App folder not empty, skipping: $($Config.InstallRoot)"
-                                    Write-Host "    Remaining items: $($remaining.Name -join ', ')" -ForegroundColor Gray
-                                }
-                            } else {
-                                Write-Warn "InstallRoot does not look like an ESS app folder. Skipping folder delete: $($Config.InstallRoot)"
-                            }
-                        }
+                catch {
+                    Write-Err "Could not fully delete app folder: $($Config.InstallRoot)"
+                    $remaining = Get-ChildItem -Path $Config.InstallRoot -Force -ErrorAction SilentlyContinue
+                    if ($remaining) {
+                        Write-Host "    Remaining items: $($remaining.Name -join ', ')" -ForegroundColor Yellow
                     }
                 }
-            } elseif ($sub -match '^\d+$') {
-                $c = $compList | Where-Object { "$($_.Num)" -eq $sub } | Select-Object -First 1
-                if ($c -and (Confirm-Step "Uninstall $($c.Display)?" -DefaultYes:$false)) {
-                    $compPath = Join-Path $Config.InstallRoot $c.Key
-                    $del = (Read-Host "Also delete its files`? ($compPath) (y/N)") -match '^[Yy]'
-                    Remove-Component -Key $c.Key -Config $Config -DeleteFiles:$del
-                }
             }
+
+            Write-Success "Complete deployment uninstalled."
+            Write-Success "Persistent storage preserved: $(Get-MediaStoragePath -Config $Config)"
         }
         "^4$" {
             # Service status / health check
@@ -3738,9 +4236,12 @@ do {
             if (Test-Path $logsPath) { Invoke-Item $logsPath } else { Write-Warn "No logs folder yet." }
         }
         "^9$" {
-            # Rollback all or an individual component
-            Initialize-Logger -Config $Config
-            Show-RollbackMenu -Config $Config
+            if (Test-DeploymentRollbackAvailable -Config $Config) {
+                Initialize-Logger -Config $Config
+                Show-RollbackMenu -Config $Config
+            } else {
+                Write-Warn "No previous successful deployment is available yet."
+            }
         }
         "^[Qq]$" { Write-Host "`nBye." -ForegroundColor Cyan }
         default  { Write-Warn "Unknown option." }
