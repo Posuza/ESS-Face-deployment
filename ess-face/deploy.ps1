@@ -1138,6 +1138,7 @@ function Get-SecretsOrInitialize {
         if ($s.db.user     -match $placeholderPattern) { $placeholders += '  db.user (e.g. "root")' }
         if ($s.db.name     -match $placeholderPattern) { $placeholders += '  db.name (e.g. "ess_face")' }
         if ($s.db.password -match $placeholderPattern) { $placeholders += '  db.password (your MySQL password)' }
+
         if ($placeholders.Count -gt 0) {
             Write-Host ""
             Write-Host " [!] deploy.secrets.json has placeholder values:" -ForegroundColor Yellow
@@ -1257,13 +1258,13 @@ function Get-OrCreateSecrets {
     $defDbUser   = if ($existing) { $existing.db.user } else { "root" }
     $defDbName   = if ($existing) { $existing.db.name } else { "ess" }
     $defDbPass   = if ($existing) { $existing.db.password } else { "" }
+
     # Database settings
     Write-Host "-- Database --" -ForegroundColor Cyan
     $dbHostIn = Edit-WithDefault -Default $defDbHost -Prompt "#Edit or Skip for default > `"host`": `""
     Write-Host "    `"host`": `"$dbHostIn`"" -ForegroundColor Green
 
     $dbUser = Edit-WithDefault -Default $defDbUser -Prompt "#Edit or Skip for default > `"user`": `""
-    Write-Host "    `"user`": `"$dbUser`"" -ForegroundColor Green
 
     $dbName = Edit-WithDefault -Default $defDbName -Prompt "#Edit or Skip for default > `"name`": `""
     Write-Host "    `"name`": `"$dbName`"" -ForegroundColor Green
@@ -1271,12 +1272,21 @@ function Get-OrCreateSecrets {
     $dbPassword = Edit-WithDefault -Default $defDbPass -Prompt "#Edit or Skip for default > `"password`": `""
     Write-Host "    `"password`": `"$dbPassword`"" -ForegroundColor Green
 
+    # SMTP settings
+
+    $emailFrom = Edit-WithDefault -Default $defSmtpFrom -Prompt "#Edit or Skip for default > `"from`": `""
+
     $secrets = [PSCustomObject]@{
         db = [PSCustomObject]@{
             host     = $dbHostIn
             user     = $dbUser
             name     = $dbName
             password = $dbPassword
+        }
+        smtp = [PSCustomObject]@{
+            user = $smtpUser
+            pass = $smtpPassword
+            from = $emailFrom
         }
     }
     $secrets | ConvertTo-Json | Set-Content $SecretsPath
@@ -1307,6 +1317,7 @@ function Confirm-DeploymentCredentials {
         -not [string]::IsNullOrWhiteSpace("$($Secrets.db.name)") -and
         -not [string]::IsNullOrWhiteSpace("$($Secrets.db.user)")
     )
+
 
     $backendEnv = Join-Path (Join-Path (Join-Path $Config.InstallRoot "backend") "repo") ".env"
     $secretKeyStatus = "will be generated on first successful backend install"
@@ -2245,6 +2256,7 @@ ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 
 FRONTEND_URL="$envFrontendUrl"
+RESET_EXPIRE_MINUTES=15
 MFA_ISSUER_NAME="ESS Face"
 
 MEDIA_STORAGE_PATH="$envMediaStoragePath"
