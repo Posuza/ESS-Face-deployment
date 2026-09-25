@@ -21,6 +21,8 @@
 #   <drive>:\ESS\storage\face-images   - persistent face profile images
 # ===========================================================
 
+# BUILD: ESS-FACE-PS51-ASCII-20260923-01
+#Requires -Version 5.1
 #Requires -RunAsAdministrator
 
 param(
@@ -83,6 +85,7 @@ $script:deploymentTransaction = $false
 $script:deploymentCandidates = @{}
 $script:deploymentStateBeforeRun = $null
 $script:liveComponentsChanged = @()
+$script:deploymentConfigChanged = $false
 
 # ===========================================================
 # ENVIRONMENT-SPECIFIC NAMES
@@ -588,6 +591,79 @@ function Initialize-MediaStorage {
 }
 
 
+
+# ===========================================================
+# COMPONENT CONFIG FINGERPRINTS
+# Used so config/secrets changes are applied even when Git HEAD did not change.
+# Only SHA-256 hashes are written; DB passwords are never stored in these files.
+# ===========================================================
+function Get-TextSha256 {
+    param([Parameter(Mandatory=$true)][string]$Text)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-FrontendDeploymentFingerprint {
+    param($Config)
+
+    $payload = [ordered]@{
+        repo         = "$($Config.FrontendRepo)"
+        branch       = "$($Config.FrontendBranch)"
+        frontendPort = [int]$Config.FrontendPort
+        apiPrefix    = "$($Config.ApiPrefix)"
+    } | ConvertTo-Json -Compress
+
+    return (Get-TextSha256 -Text $payload)
+}
+
+function Get-BackendDeploymentFingerprint {
+    param($Config, $Secrets)
+
+    $payload = [ordered]@{
+        repo              = "$($Config.BackendRepo)"
+        branch            = "$($Config.BackendBranch)"
+        backendPort       = [int]$Config.BackendPort
+        apiPrefix         = "$($Config.ApiPrefix)"
+        frontendPublicUrl = "$(Get-FrontendPublicUrl -Config $Config)"
+        mediaStoragePath  = "$(Get-MediaStoragePath -Config $Config)"
+        dbHost            = "$($Secrets.db.host)"
+        dbPort            = [int]$Secrets.db.port
+        dbName            = "$($Secrets.db.name)"
+        dbUser            = "$($Secrets.db.user)"
+        dbPassword        = "$($Secrets.db.password)"
+    } | ConvertTo-Json -Compress
+
+    return (Get-TextSha256 -Text $payload)
+}
+
+function Get-SavedComponentFingerprint {
+    param($Config, [Parameter(Mandatory=$true)][string]$Component)
+
+    $path = Join-Path (Join-Path $Config.InstallRoot $Component) "deployment-config.sha256"
+    if (-not (Test-Path $path)) { return $null }
+    return ("$(Get-Content $path -Raw -ErrorAction SilentlyContinue)").Trim()
+}
+
+function Save-ComponentFingerprint {
+    param(
+        $Config,
+        [Parameter(Mandatory=$true)][string]$Component,
+        [Parameter(Mandatory=$true)][string]$Fingerprint
+    )
+
+    if ($script:dryRun) { return }
+    $dir = Join-Path $Config.InstallRoot $Component
+    New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    Set-Content -Path (Join-Path $dir "deployment-config.sha256") -Value $Fingerprint -Encoding ASCII -Force
+}
+
 # ===========================================================
 # DEPLOYMENT STATE
 # One file at <InstallRoot>\deployment-state.json.
@@ -770,6 +846,10 @@ function Register-SuccessfulComponentDeployment {
 
 function Test-FullDeploymentHasChanges {
     param($Config)
+
+    if ($script:deploymentConfigChanged) {
+        return $true
+    }
 
     $state = Get-DeploymentState -Config $Config
     if (-not $state -or -not $state.deploymentVersions -or @($state.deploymentVersions).Count -eq 0) {
@@ -1123,7 +1203,7 @@ function Get-SecretsOrInitialize {
         try {
             $s = Get-Content $SecretsPath -Raw -ErrorAction Stop | ConvertFrom-Json
         } catch {
-            Write-Warn "Could not read $SecretsPath — will recreate."
+            Write-Warn "Could not read $SecretsPath - will recreate."
             Write-Log "Failed to read $SecretsPath : $_" -Level "WARN"
             $s = $null
         }
@@ -1132,7 +1212,7 @@ function Get-SecretsOrInitialize {
     $placeholderPattern = 'REPLACE_WITH_|YOUR_|CHANGE_THIS|PLACEHOLDER'
 
     if ($s) {
-        # File exists — check for placeholder values
+        # File exists - check for placeholder values
         $placeholders = @()
         if ($s.db.host     -match $placeholderPattern) { $placeholders += '  db.host (e.g. "localhost" or your MySQL server address)' }
         if ($s.db.user     -match $placeholderPattern) { $placeholders += '  db.user (e.g. "root")' }
@@ -1173,13 +1253,13 @@ function Get-SecretsOrInitialize {
                 }
             }
 
-            # User declined — cancel deployment
+            # User declined - cancel deployment
             Write-Warn "Deployment cancelled. Edit $SecretsPath first, then re-run."
             Write-Host ""
             return $null
         }
 
-        # All values are real — happy path
+        # All values are real - happy path
         Write-Log "Secrets loaded from $SecretsPath"
         return $s
     }
@@ -1609,7 +1689,7 @@ function Verify-Health {
 
     # Show port summary after health checks
     Write-Host ""
-    Write-Host " ── Ports ──" -ForegroundColor Cyan
+    Write-Host " -- Ports --" -ForegroundColor Cyan
     Write-Host "  Frontend : $($Config.FrontendPort)" -ForegroundColor Green
     Write-Host "  Backend  : $($Config.BackendPort)" -ForegroundColor Green
     if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
@@ -1658,12 +1738,24 @@ function Install-Frontend {
     }
 
     $liveFrontendChanged = $false
+    $frontendFingerprint = Get-FrontendDeploymentFingerprint -Config $Config
+    $savedFrontendFingerprint = Get-SavedComponentFingerprint -Config $Config -Component "frontend"
+    $frontendConfigChanged = ($savedFrontendFingerprint -ne $frontendFingerprint)
 
     try {
         New-Item -Path $appDir -ItemType Directory -Force | Out-Null
 
         if (Test-Path (Join-Path $repoDir ".git")) {
-            Write-Host "    Checking Git for frontend update..." -ForegroundColor Gray
+            Write-Host "    Checking Git/config for frontend update..." -ForegroundColor Gray
+
+            $currentOrigin = (& git -C $repoDir remote get-url origin 2>$null | Select-Object -First 1)
+            if ("$currentOrigin".Trim() -ne "$($Config.FrontendRepo)".Trim()) {
+                Write-Host "    Frontend repository URL changed; updating Git origin..." -ForegroundColor Gray
+                & git -C $repoDir remote set-url origin $Config.FrontendRepo
+                if ($LASTEXITCODE -ne 0) { throw "Could not update frontend Git origin URL." }
+                $frontendConfigChanged = $true
+            }
+
             git -C $repoDir fetch --prune origin "+refs/heads/$($Config.FrontendBranch):refs/remotes/origin/$($Config.FrontendBranch)" 2>&1 | Add-FileLog -Path $installLog
             if ($LASTEXITCODE -ne 0) {
                 throw "Frontend branch '$($Config.FrontendBranch)' could not be fetched. Check FrontendBranch in deploy.config.json. Live frontend was not changed."
@@ -1672,10 +1764,15 @@ function Install-Frontend {
             $remoteHead = (& git -C $repoDir rev-parse "origin/$($Config.FrontendBranch)" 2>$null | Select-Object -First 1).Trim()
             $localHead = (Get-GitHead -RepoDir $repoDir)
 
-            if ($wasInstalled -and $localHead -eq $remoteHead) {
-                Write-Success "Frontend is already up to date: $localHead"
+            if ($wasInstalled -and $localHead -eq $remoteHead -and -not $frontendConfigChanged) {
+                Write-Success "Frontend code and deployment configuration are already current: $localHead"
                 Register-SuccessfulComponentDeployment -Config $Config -Component "frontend" -Commit $localHead
                 return $true
+            }
+
+            if ($wasInstalled -and $localHead -eq $remoteHead -and $frontendConfigChanged) {
+                Write-Host "    Frontend Git is unchanged, but deployment configuration changed; rebuilding/restarting frontend." -ForegroundColor Cyan
+                $script:deploymentConfigChanged = $true
             }
 
             if ($wasInstalled) {
@@ -1817,6 +1914,8 @@ try {
         if (-not $healthOk) { throw "Frontend candidate did not pass health check." }
 
         Register-SuccessfulComponentDeployment -Config $Config -Component "frontend" -Commit $candidate
+        Save-ComponentFingerprint -Config $Config -Component "frontend" -Fingerprint $frontendFingerprint
+        if ($frontendConfigChanged) { $script:deploymentConfigChanged = $true }
         $script:installedComponents += "frontend"
         Write-Success "Frontend update successful: $candidate"
         return $true
@@ -2112,22 +2211,33 @@ function Install-Backend {
             $oldGoodBackend = Get-GitHead -RepoDir $repoDir
         }
 
+        $backendFingerprint = Get-BackendDeploymentFingerprint -Config $Config -Secrets $Secrets
+        $savedBackendFingerprint = Get-SavedComponentFingerprint -Config $Config -Component "backend"
+        $backendConfigChanged = ($savedBackendFingerprint -ne $backendFingerprint)
+
         # --- 0. Check Git before stopping a healthy existing service ---
         # Service is stopped only when a real backend update is required.
 
         # --- 1. Clone or hard-reset backend repo ---
         if (Test-Path (Join-Path $repoDir ".git")) {
-            Write-Host "    Checking Git for backend update..." -ForegroundColor Gray
-            Write-FileLog -Path $installLog -Text "Repo exists, checking remote HEAD"
+            Write-Host "    Checking Git/config for backend update..." -ForegroundColor Gray
+            Write-FileLog -Path $installLog -Text "Repo exists, checking remote HEAD and deployment configuration"
             Push-Location $repoDir
             try {
+                $currentOrigin = (& git remote get-url origin 2>$null | Select-Object -First 1)
+                if ("$currentOrigin".Trim() -ne "$($Config.BackendRepo)".Trim()) {
+                    Write-Host "    Backend repository URL changed; updating Git origin..." -ForegroundColor Gray
+                    Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git remote set-url" -Command { git remote set-url origin $Config.BackendRepo }
+                    $backendConfigChanged = $true
+                }
+
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git fetch" -Command { git fetch --prune origin "+refs/heads/$($Config.BackendBranch):refs/remotes/origin/$($Config.BackendBranch)" }
 
                 $localHead = (& git rev-parse HEAD 2>$null | Select-Object -First 1).Trim()
                 $remoteHead = (& git rev-parse "origin/$($Config.BackendBranch)" 2>$null | Select-Object -First 1).Trim()
 
-                if ($localHead -eq $remoteHead -and (Test-ComponentInstalled -Config $Config -Component "backend")) {
-                    Write-Success "Backend is already up to date: $localHead"
+                if ($localHead -eq $remoteHead -and (Test-ComponentInstalled -Config $Config -Component "backend") -and -not $backendConfigChanged) {
+                    Write-Success "Backend code and deployment configuration are already current: $localHead"
                     Register-SuccessfulComponentDeployment -Config $Config -Component "backend" -Commit $localHead
 
                     $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
@@ -2135,6 +2245,11 @@ function Install-Backend {
                         Start-Service -Name $svcName -ErrorAction SilentlyContinue
                     }
                     return $true
+                }
+
+                if ($localHead -eq $remoteHead -and $backendConfigChanged) {
+                    Write-Host "    Backend Git is unchanged, but DB/runtime configuration changed; regenerating .env and restarting backend." -ForegroundColor Cyan
+                    $script:deploymentConfigChanged = $true
                 }
 
                 Invoke-BackendLoggedCommand -LogPath $installLog -StepName "git reset" -Command { git reset --hard "origin/$($Config.BackendBranch)" }
@@ -2448,6 +2563,8 @@ catch {
             Write-FileLog -Path $installLog -Text "Backend active version: $activeBackendCommit"
         }
 
+        Save-ComponentFingerprint -Config $Config -Component "backend" -Fingerprint $backendFingerprint
+        if ($backendConfigChanged) { $script:deploymentConfigChanged = $true }
         $script:installedComponents += "backend"
         Write-Log "Backend installed/updated successfully on port $appPort"
         return $true
@@ -2496,15 +2613,15 @@ function Install-Caddy {
         Write-Host "      Proxy:      $($Config.CaddyPort) (fixed)" -ForegroundColor Green
         Write-FileLog -Path $caddyInstallLog -Text "Fixed proxy port: $($Config.CaddyPort)"
 
-        # ── Port summary ──
+        # -- Port summary --
         $adminDisplay = $Config.CaddyAdminPort
         $proxyDisplay = $Config.CaddyPort
         Write-Host ""
-        Write-Host "    ┌──────────────────────────────────┐" -ForegroundColor Cyan
-        Write-Host "    │  Caddy service ports:             │" -ForegroundColor Cyan
-        Write-Host "    │    Proxy  (users visit this): $proxyDisplay" -ForegroundColor Green
-        Write-Host "    │    Admin  (Caddy internal): $adminDisplay" -ForegroundColor Gray
-        Write-Host "    └──────────────────────────────────┘" -ForegroundColor Cyan
+        Write-Host "    +----------------------------------+" -ForegroundColor Cyan
+        Write-Host "    |  Caddy service ports:             |" -ForegroundColor Cyan
+        Write-Host "    |    Proxy  (users visit this): $proxyDisplay" -ForegroundColor Green
+        Write-Host "    |    Admin  (Caddy internal): $adminDisplay" -ForegroundColor Gray
+        Write-Host "    +----------------------------------+" -ForegroundColor Cyan
         Write-Host ""
         Write-FileLog -Path $caddyInstallLog -Text "Ports: proxy=$proxyDisplay, admin=$adminDisplay"
 
@@ -2563,69 +2680,19 @@ function Install-Caddy {
         }
         Write-FileLog -Path $caddyInstallLog -Text "--- end Caddyfile ---"
 
-        # ── Write runner script ──
+        # -- Write runner script --
         $runnerScript = Join-Path $caddyDir "caddy-run.ps1"
         $defaultProxyPort = $Config.CaddyPort
         $adminPort = $Config.CaddyAdminPort
-        $runnerContent = @'
-$caddyDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$caddyExe = Join-Path $caddyDir "caddy.exe"
-$caddyfile = Join-Path $caddyDir "Caddyfile"
-$logsDir   = Join-Path (Join-Path (Split-Path $caddyDir -Parent) "logs") "caddy"
-if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
-
-$svcTs = (Get-Date).ToString("yyyyMMdd-HHmmss")
-$caddyLog = Join-Path $logsDir "caddy_service_${svcTs}.log"
-$statusFile = Join-Path $caddyDir "caddy-ports.json"
-Remove-Item -Path $statusFile -Force -ErrorAction SilentlyContinue
-
-# Use TcpClient instead of netstat for port checking (reliable across locales/Windows versions)
-function Test-PortInUse {
-    param([int]$Port)
-    $tcp = $null
-    try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $iar = $tcp.BeginConnect("127.0.0.1", $Port, $null, $null)
-        $connected = $iar.AsyncWaitHandle.WaitOne(500)
-        if ($connected -and $tcp.Connected) {
-            $tcp.EndConnect($iar)
-            return $true
-        }
-    } catch { }
-    finally { if ($tcp) { $tcp.Close() } }
-    return $false
-}
-
-"========== Service started at $(Get-Date) ==========" | Out-File -FilePath $caddyLog -Encoding ASCII
-
-# Use the configured fixed admin API port.
-$adminPort = __CADDY_ADMIN_PORT__
-if (Test-PortInUse -Port $adminPort) {
-    "FATAL: Caddy admin API port $adminPort is already in use. Service cannot start." | Out-File -FilePath $caddyLog -Append
-    exit 1
-}
-$env:CADDY_ADMIN = "127.0.0.1:$adminPort"
-"    Admin port (fixed): $adminPort" | Out-File -FilePath $caddyLog -Append
-
-# Use the configured fixed proxy port.
-$proxyPort = __DEFAULT_PROXY_PORT__
-if (Test-PortInUse -Port $proxyPort) {
-    "FATAL: Caddy proxy port $proxyPort is already in use. Service cannot start." | Out-File -FilePath $caddyLog -Append
-    exit 1
-}
-$env:CADDY_PORT = "$proxyPort"
-"    Proxy port: $proxyPort" | Out-File -FilePath $caddyLog -Append
-
-# Write the fixed ports to a status file so health checks can find Caddy.
-@{admin = $adminPort; proxy = $proxyPort} | ConvertTo-Json | Out-File -FilePath $statusFile -Force
-"    Ports status: $statusFile" | Out-File -FilePath $caddyLog -Append
-
-"    Starting Caddy..." | Out-File -FilePath $caddyLog -Append
-& $caddyExe run --config $caddyfile 2>&1 | Out-File -FilePath $caddyLog -Append
-"========== Service STOPPED at $(Get-Date) ==========" | Out-File -FilePath $caddyLog -Append
-'@
-        $runnerContent = $runnerContent.Replace('__DEFAULT_PROXY_PORT__', $defaultProxyPort)
-        $runnerContent = $runnerContent.Replace('__CADDY_ADMIN_PORT__', $adminPort)
+        # Windows PowerShell 5.1-safe embedded Caddy runner template.
+        # The runner body is Base64-encoded so the outer deployment script
+        # does not need nested here-strings or quoted code arrays.
+        $runnerTemplateBase64 = "JGNhZGR5RGlyID0gU3BsaXQtUGF0aCAtUGFyZW50ICRNeUludm9jYXRpb24uTXlDb21tYW5kLlBhdGgKJGNhZGR5RXhlID0gSm9pbi1QYXRoICRjYWRkeURpciAiY2FkZHkuZXhlIgokY2FkZHlmaWxlID0gSm9pbi1QYXRoICRjYWRkeURpciAiQ2FkZHlmaWxlIgokbG9nc0RpciA9IEpvaW4tUGF0aCAoSm9pbi1QYXRoIChTcGxpdC1QYXRoICRjYWRkeURpciAtUGFyZW50KSAibG9ncyIpICJjYWRkeSIKaWYgKC1ub3QgKFRlc3QtUGF0aCAkbG9nc0RpcikpIHsKICAgIE5ldy1JdGVtIC1JdGVtVHlwZSBEaXJlY3RvcnkgLVBhdGggJGxvZ3NEaXIgLUZvcmNlIHwgT3V0LU51bGwKfQoKJHN2Y1RzID0gKEdldC1EYXRlKS5Ub1N0cmluZygieXl5eU1NZGQtSEhtbXNzIikKJGNhZGR5TG9nID0gSm9pbi1QYXRoICRsb2dzRGlyICJjYWRkeV9zZXJ2aWNlXyR7c3ZjVHN9LmxvZyIKJHN0YXR1c0ZpbGUgPSBKb2luLVBhdGggJGNhZGR5RGlyICJjYWRkeS1wb3J0cy5qc29uIgpSZW1vdmUtSXRlbSAtUGF0aCAkc3RhdHVzRmlsZSAtRm9yY2UgLUVycm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUKCmZ1bmN0aW9uIFRlc3QtUG9ydEluVXNlIHsKICAgIHBhcmFtKFtpbnRdJFBvcnQpCgogICAgJHRjcCA9ICRudWxsCiAgICB0cnkgewogICAgICAgICR0Y3AgPSBOZXctT2JqZWN0IFN5c3RlbS5OZXQuU29ja2V0cy5UY3BDbGllbnQKICAgICAgICAkaWFyID0gJHRjcC5CZWdpbkNvbm5lY3QoIjEyNy4wLjAuMSIsICRQb3J0LCAkbnVsbCwgJG51bGwpCiAgICAgICAgJGNvbm5lY3RlZCA9ICRpYXIuQXN5bmNXYWl0SGFuZGxlLldhaXRPbmUoNTAwKQoKICAgICAgICBpZiAoJGNvbm5lY3RlZCAtYW5kICR0Y3AuQ29ubmVjdGVkKSB7CiAgICAgICAgICAgICR0Y3AuRW5kQ29ubmVjdCgkaWFyKQogICAgICAgICAgICByZXR1cm4gJHRydWUKICAgICAgICB9CiAgICB9CiAgICBjYXRjaCB7CiAgICB9CiAgICBmaW5hbGx5IHsKICAgICAgICBpZiAoJHRjcCkgewogICAgICAgICAgICAkdGNwLkNsb3NlKCkKICAgICAgICB9CiAgICB9CgogICAgcmV0dXJuICRmYWxzZQp9CgoiPT09PT09PT09PSBTZXJ2aWNlIHN0YXJ0ZWQgYXQgJChHZXQtRGF0ZSkgPT09PT09PT09PSIgfCBPdXQtRmlsZSAtRmlsZVBhdGggJGNhZGR5TG9nIC1FbmNvZGluZyBBU0NJSQoKJGFkbWluUG9ydCA9IF9fQ0FERFlfQURNSU5fUE9SVF9fCmlmIChUZXN0LVBvcnRJblVzZSAtUG9ydCAkYWRtaW5Qb3J0KSB7CiAgICAiRkFUQUw6IENhZGR5IGFkbWluIEFQSSBwb3J0ICRhZG1pblBvcnQgaXMgYWxyZWFkeSBpbiB1c2UuIFNlcnZpY2UgY2Fubm90IHN0YXJ0LiIgfCBPdXQtRmlsZSAtRmlsZVBhdGggJGNhZGR5TG9nIC1BcHBlbmQKICAgIGV4aXQgMQp9CgokZW52OkNBRERZX0FETUlOID0gIjEyNy4wLjAuMTokYWRtaW5Qb3J0IgoiQWRtaW4gcG9ydDogJGFkbWluUG9ydCIgfCBPdXQtRmlsZSAtRmlsZVBhdGggJGNhZGR5TG9nIC1BcHBlbmQKCiRwcm94eVBvcnQgPSBfX0RFRkFVTFRfUFJPWFlfUE9SVF9fCmlmIChUZXN0LVBvcnRJblVzZSAtUG9ydCAkcHJveHlQb3J0KSB7CiAgICAiRkFUQUw6IENhZGR5IHByb3h5IHBvcnQgJHByb3h5UG9ydCBpcyBhbHJlYWR5IGluIHVzZS4gU2VydmljZSBjYW5ub3Qgc3RhcnQuIiB8IE91dC1GaWxlIC1GaWxlUGF0aCAkY2FkZHlMb2cgLUFwcGVuZAogICAgZXhpdCAxCn0KCiRlbnY6Q0FERFlfUE9SVCA9ICIkcHJveHlQb3J0IgoiUHJveHkgcG9ydDogJHByb3h5UG9ydCIgfCBPdXQtRmlsZSAtRmlsZVBhdGggJGNhZGR5TG9nIC1BcHBlbmQKCkB7CiAgICBhZG1pbiA9ICRhZG1pblBvcnQKICAgIHByb3h5ID0gJHByb3h5UG9ydAp9IHwgQ29udmVydFRvLUpzb24gfCBPdXQtRmlsZSAtRmlsZVBhdGggJHN0YXR1c0ZpbGUgLUZvcmNlCgoiU3RhcnRpbmcgQ2FkZHkuLi4iIHwgT3V0LUZpbGUgLUZpbGVQYXRoICRjYWRkeUxvZyAtQXBwZW5kCiYgJGNhZGR5RXhlIHJ1biAtLWNvbmZpZyAkY2FkZHlmaWxlIDI+JjEgfCBPdXQtRmlsZSAtRmlsZVBhdGggJGNhZGR5TG9nIC1BcHBlbmQKIj09PT09PT09PT0gU2VydmljZSBTVE9QUEVEIGF0ICQoR2V0LURhdGUpID09PT09PT09PT0iIHwgT3V0LUZpbGUgLUZpbGVQYXRoICRjYWRkeUxvZyAtQXBwZW5kCg=="
+        $runnerContent = [System.Text.Encoding]::UTF8.GetString(
+            [System.Convert]::FromBase64String($runnerTemplateBase64)
+        )
+        $runnerContent = $runnerContent.Replace("__DEFAULT_PROXY_PORT__", [string]$defaultProxyPort)
+        $runnerContent = $runnerContent.Replace("__CADDY_ADMIN_PORT__", [string]$adminPort)
         Set-Content -Path $runnerScript -Value $runnerContent -Force
         Write-FileLog -Path $caddyInstallLog -Text "Runner script written to $runnerScript"
         Write-FileLog -Path $caddyInstallLog -Text "--- runner script (default proxy port: $defaultProxyPort) ---"
@@ -3265,116 +3332,151 @@ function Invoke-ComponentInstall {
 }
 
 function Remove-Component {
-    param($Key, $Config, [switch]$DeleteFiles)
+    param(
+        [string]$Key,
+        $Config,
+        [switch]$DeleteFiles
+    )
+
     $svcName = Get-DeployServiceName -Config $Config -Component $Key
     Write-Step "Removing $Key"
 
-    # Log uninstall actions
-    $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
-    $uninstallLog = Join-Path $Config.InstallRoot "logs\${Key}_uninstall_${ts}.log"
-    Write-FileLog -Path $uninstallLog -Text "========== Uninstalling $Key =========="
+    $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+    $logsRoot = Join-Path $Config.InstallRoot "logs"
 
-    if (-not $script:dryRun) {
-        # --- Step 1: Stop the service (if running) — no force-kill, no silent skip ---
-        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-        if ($svc) {
-            if ($svc.Status -eq 'Running') {
-                Write-Host "    Stopping service $svcName..." -ForegroundColor Gray
-                Write-FileLog -Path $uninstallLog -Text "Stopping service $svcName (status: Running)"
-                try {
-                    Stop-Service -Name $svcName -ErrorAction Stop 2>&1 | Add-FileLog -Path $uninstallLog
-                } catch {
-                    Write-Err "Failed to stop service '$svcName': $_"
-                    Write-FileLog -Path $uninstallLog -Text "ERROR: Stop-Service failed: $_"
-                    throw "Cannot stop service '$svcName'. Please stop it manually or restart the computer, then run uninstall again."
-                }
-                Write-Host "    Waiting for service to fully stop (checking every 3s)..." -ForegroundColor Gray
-                $waited = 0
-                $maxChecks = 10
-                $stopped = $false
-                while ($waited -lt $maxChecks) {
-                    Start-Sleep -Seconds 3
-                    $waited++
-                    $check = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-                    if (-not $check -or $check.Status -eq 'Stopped') {
-                        $stopped = $true
-                        break
-                    }
-                    Write-Host "      Check $waited/$maxChecks — service still $($check.Status)..." -ForegroundColor Gray
-                }
-                if (-not $stopped) {
-                    Write-Err "Service '$svcName' did not stop after $($maxChecks) checks (approx. 30s)."
-                    Write-Err "Please stop it manually or restart your computer, then run uninstall again."
-                    Write-FileLog -Path $uninstallLog -Text "ERROR: Service $svcName still running after $($maxChecks) checks — aborting uninstall"
-                    throw "Service '$svcName' refused to stop. Cannot proceed."
-                }
-                Write-Success "Service stopped"
-                Write-FileLog -Path $uninstallLog -Text "Service stopped successfully"
-            } else {
-                Write-Host "    Service already stopped (status: $($svc.Status))" -ForegroundColor Gray
-                Write-FileLog -Path $uninstallLog -Text "Service already stopped (status: $($svc.Status))"
-            }
-        } else {
-            Write-Host "    Service not found, nothing to stop" -ForegroundColor Gray
-            Write-FileLog -Path $uninstallLog -Text "Service not found, nothing to stop"
+    if (-not (Test-Path $logsRoot)) {
+        New-Item -Path $logsRoot -ItemType Directory -Force | Out-Null
+    }
+
+    $uninstallLog = Join-Path $logsRoot ($Key + "_uninstall_" + $ts + ".log")
+    Write-FileLog -Path $uninstallLog -Text ("========== Uninstalling " + $Key + " ==========")
+
+    if ($script:dryRun) {
+        $fileAction = "keep"
+        if ($DeleteFiles) {
+            $fileAction = "delete"
         }
 
-        # --- Step 2: Unregister service ---
+        Write-Warn ("[DRY-RUN] Would remove " + $Key + " service and " + $fileAction + " its files")
+        Write-FileLog -Path $uninstallLog -Text ("[DRY-RUN] Would uninstall " + $Key)
+        return
+    }
+
+    # Step 1: stop the service.
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+
+    if ($svc) {
+        if ($svc.Status -ne "Stopped") {
+            Write-Host ("    Stopping service " + $svcName + "...") -ForegroundColor Gray
+            Write-FileLog -Path $uninstallLog -Text ("Stopping service " + $svcName)
+
+            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+
+            $waited = 0
+            $maxChecks = 10
+            $stopped = $false
+
+            while ($waited -lt $maxChecks) {
+                Start-Sleep -Seconds 3
+                $waited = $waited + 1
+                $check = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+
+                if (-not $check) {
+                    $stopped = $true
+                    break
+                }
+
+                if ($check.Status -eq "Stopped") {
+                    $stopped = $true
+                    break
+                }
+
+                Write-Host ("      Check " + $waited + "/" + $maxChecks + " - service still " + $check.Status + "...") -ForegroundColor Gray
+            }
+
+            if (-not $stopped) {
+                Write-Err ("Service '" + $svcName + "' did not stop.")
+                Write-FileLog -Path $uninstallLog -Text ("ERROR: Service " + $svcName + " did not stop.")
+                return
+            }
+
+            Write-Success "Service stopped"
+            Write-FileLog -Path $uninstallLog -Text "Service stopped successfully"
+        }
+        else {
+            Write-Host "    Service already stopped." -ForegroundColor Gray
+            Write-FileLog -Path $uninstallLog -Text "Service already stopped"
+        }
+    }
+    else {
+        Write-Host "    Service not found, nothing to stop." -ForegroundColor Gray
+        Write-FileLog -Path $uninstallLog -Text "Service not found"
+    }
+
+    # Step 2: unregister service.
+    if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
         Write-Host "    Unregistering service..." -ForegroundColor Gray
         Write-FileLog -Path $uninstallLog -Text "Unregistering service via servy-cli"
-        servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $uninstallLog
+
+        & servy-cli uninstall --name="$svcName" --quiet 2>&1 | Add-FileLog -Path $uninstallLog
         Start-Sleep -Milliseconds 500
 
         if (Get-Service -Name $svcName -ErrorAction SilentlyContinue) {
-            Write-Warn "$svcName is still registered — restart your computer and re-run uninstall."
-            Write-FileLog -Path $uninstallLog -Text "WARN: $svcName still registered after servy-cli uninstall"
-        } else {
-            Write-Success "$svcName service removed."
-            Write-FileLog -Path $uninstallLog -Text "OK: $svcName removed"
+            Write-Warn ($svcName + " is still registered. Restart Windows and run uninstall again if necessary.")
+            Write-FileLog -Path $uninstallLog -Text ("WARN: " + $svcName + " still registered after servy-cli uninstall")
+        }
+        else {
+            Write-Success ($svcName + " service removed.")
+            Write-FileLog -Path $uninstallLog -Text ("OK: " + $svcName + " removed")
+        }
+    }
+
+    # Step 3: optionally delete component files.
+    if ($DeleteFiles) {
+        $componentPath = Join-Path $Config.InstallRoot $Key
+
+        if (Test-Path $componentPath) {
+            Write-Host ("    Deleting " + $componentPath + "...") -ForegroundColor Gray
+            Remove-Item -Path $componentPath -Recurse -Force -ErrorAction SilentlyContinue
+
+            if (Test-Path $componentPath) {
+                Write-Err ("Could not delete '" + $componentPath + "'. A process may still have files locked.")
+                Write-FileLog -Path $uninstallLog -Text ("ERROR: Could not delete " + $componentPath)
+                return
+            }
+
+            Write-Success ("Deleted " + $componentPath)
+            Write-FileLog -Path $uninstallLog -Text ("OK: Deleted " + $componentPath)
         }
 
-        # --- Step 3: Delete files (only after service is confirmed stopped) ---
-        if ($DeleteFiles) {
-            $path = Join-Path $Config.InstallRoot $Key
-            if (Test-Path $path) {
-                Write-Host "    Deleting $path..." -ForegroundColor Gray
-                Write-FileLog -Path $uninstallLog -Text "Deleting $path"
-                try {
-                    Remove-Item -Path $path -Recurse -Force -ErrorAction Stop 2>&1 | Add-FileLog -Path $uninstallLog
-                    Write-Success "Deleted $path"
-                    Write-FileLog -Path $uninstallLog -Text "OK: Deleted $path"
-                } catch {
-                    Write-Err "Failed to delete $path"
-                    Write-FileLog -Path $uninstallLog -Text "ERROR deleting $path`: $_"
-                    throw "Could not delete '$path'. A process may have files locked there. Please restart and try again."
+        $logSubDir = Join-Path $logsRoot $Key
+        if (Test-Path $logSubDir) {
+            Remove-Item -Path $logSubDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        # Remove deleted component from deployment-state.json.
+        $state = Get-DeploymentState -Config $Config
+
+        if ($state) {
+            if ($state.deploymentVersions) {
+                if (@($state.deploymentVersions).Count -gt 0) {
+                    $current = @($state.deploymentVersions)[0]
+
+                    if ($current.components) {
+                        $componentState = $current.components.$Key
+
+                        if ($componentState) {
+                            $componentState.current = $null
+                            $componentState.previous = $null
+                            Save-DeploymentState -Config $Config -State $state
+                        }
+                    }
                 }
             }
-            # Also remove this component's log subfolder
-            $logSubDir = Join-Path (Join-Path $Config.InstallRoot "logs") $Key
-            if (Test-Path $logSubDir) {
-                Remove-Item -Path $logSubDir -Recurse -Force -ErrorAction SilentlyContinue 2>&1 | Add-FileLog -Path $uninstallLog
-                Write-Success "Deleted logs for $Key"
-                Write-FileLog -Path $uninstallLog -Text "OK: Deleted logs subfolder $logSubDir"
-            }
-        }
-    } else {
-        Write-Warn "[DRY-RUN] Would remove $Key service and $(if($DeleteFiles){'delete'}else{'keep'}) its files"
-        Write-FileLog -Path $uninstallLog -Text "[DRY-RUN] Would uninstall $Key"
-    }
-    # If component files were deleted, remove it from the current deployment state.
-    if ($DeleteFiles -and -not $script:dryRun) {
-        $state = Get-DeploymentState -Config $Config
-        if ($state -and $state.deploymentVersions -and @($state.deploymentVersions).Count -gt 0) {
-            $current = @($state.deploymentVersions)[0]
-            if ($current.components.$Key) {
-                $current.components.$Key.current = $null
-                $current.components.$Key.previous = $null
-                Save-DeploymentState -Config $Config -State $state
-            }
         }
     }
 
-    Write-Log "Component removed: $Key"
+    Write-Log ("Component removed: " + $Key)
 }
 
 # ===========================================================
@@ -3412,7 +3514,7 @@ function Start-AllServices {
         Start-Sleep -Seconds 3
         $caddyPorts = Get-CaddyActualPorts -Config $Config
         Write-Host ""
-        Write-Host " ── Caddy Ports ──" -ForegroundColor Cyan
+        Write-Host " -- Caddy Ports --" -ForegroundColor Cyan
         Write-Host "  Proxy : $($caddyPorts.proxy)" -ForegroundColor Green
         if ($caddyPorts.admin) {
             Write-Host "  Admin : $($caddyPorts.admin)" -ForegroundColor Gray
@@ -3452,7 +3554,7 @@ function Show-Status {
     $rows | Format-Table -AutoSize | Out-Host
 
     # Show port summary alongside health
-    Write-Host " ── Addresses ──" -ForegroundColor Cyan
+    Write-Host " -- Addresses --" -ForegroundColor Cyan
     Write-Host "  Frontend : http://localhost:$($Config.FrontendPort)" -ForegroundColor Green
     Write-Host "  Backend  : http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)" -ForegroundColor Green
     if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
@@ -3481,6 +3583,7 @@ function Invoke-FullDeploy {
     $script:deploymentTransaction = $true
     $script:deploymentCandidates = @{}
     $script:liveComponentsChanged = @()
+    $script:deploymentConfigChanged = $false
     $script:deploymentStateBeforeRun = Copy-ObjectDeep -Object (Get-DeploymentState -Config $Config)
 
     # 1. Validate install drive exists (prompt already happened at entry)
@@ -3557,7 +3660,7 @@ function Invoke-FullDeploy {
             Write-Success "Frontend ready on port $($Config.FrontendPort)"
             Write-Log "Frontend installed on port $($Config.FrontendPort)"
         } else {
-            Write-Err "Frontend installation FAILED — skipping remaining components"
+            Write-Err "Frontend installation FAILED - skipping remaining components"
             $allSucceeded = $false
         }
     }
@@ -3573,7 +3676,7 @@ function Invoke-FullDeploy {
             Write-Success "Backend ready on port $($Config.BackendPort)"
             Write-Log "Backend installed on port $($Config.BackendPort)"
         } else {
-            Write-Err "Backend installation FAILED — skipping remaining components"
+            Write-Err "Backend installation FAILED - skipping remaining components"
             $allSucceeded = $false
         }
     }
@@ -3587,7 +3690,7 @@ function Invoke-FullDeploy {
             Write-Success "Caddy ready on port $($Config.CaddyPort)"
             Write-Log "Caddy installed on port $($Config.CaddyPort)"
         } else {
-            Write-Err "Caddy installation FAILED — skipping remaining components"
+            Write-Err "Caddy installation FAILED - skipping remaining components"
             $allSucceeded = $false
         }
     }
@@ -3660,20 +3763,20 @@ function Invoke-FullDeploy {
         # Architecture diagram
         Write-Host ""
         Write-Host "  Local access: http://localhost:${displayCaddyPort}" -ForegroundColor Green
-        Write-Host "  ┌──────────────────────────────────────────────────┐" -ForegroundColor Cyan
-        Write-Host "  │                   CADDY                         │" -ForegroundColor Cyan
-        Write-Host "  │             (port ${displayCaddyPort})                │" -ForegroundColor Cyan
-        Write-Host "  └────────┬─────────────────────────┬───────────────┘" -ForegroundColor Cyan
-        Write-Host "           │                         │" -ForegroundColor Cyan
-        Write-Host "           ▼                         ▼" -ForegroundColor Cyan
-        Write-Host "  ┌────────────────┐        ┌──────────────────┐" -ForegroundColor Cyan
-        Write-Host "  │   FRONTEND     │        │     BACKEND      │" -ForegroundColor Cyan
-        Write-Host "  │  (port $($Config.FrontendPort))    │        │    (port $($Config.BackendPort))     │" -ForegroundColor Cyan
-        Write-Host "  └────────────────┘        └──────────────────┘" -ForegroundColor Cyan
+        Write-Host "  +--------------------------------------------------+" -ForegroundColor Cyan
+        Write-Host "  |                   CADDY                         |" -ForegroundColor Cyan
+        Write-Host "  |             (port ${displayCaddyPort})                |" -ForegroundColor Cyan
+        Write-Host "  +--------+-------------------------+---------------+" -ForegroundColor Cyan
+        Write-Host "           |                         |" -ForegroundColor Cyan
+        Write-Host "           v                         v" -ForegroundColor Cyan
+        Write-Host "  +----------------+        +------------------+" -ForegroundColor Cyan
+        Write-Host "  |   FRONTEND     |        |     BACKEND      |" -ForegroundColor Cyan
+        Write-Host "  |  (port $($Config.FrontendPort))    |        |    (port $($Config.BackendPort))     |" -ForegroundColor Cyan
+        Write-Host "  +----------------+        +------------------+" -ForegroundColor Cyan
         Write-Host ""
-        Write-Host "  Browser → http://localhost:${displayCaddyPort}  →  Caddy routes:" -ForegroundColor White
-        Write-Host "    $($Config.ApiPrefix)/*  →  Backend  (:$($Config.BackendPort))" -ForegroundColor Gray
-        Write-Host "    /*               →  Frontend (:$($Config.FrontendPort))" -ForegroundColor Gray
+        Write-Host "  Browser -> http://localhost:${displayCaddyPort}  ->  Caddy routes:" -ForegroundColor White
+        Write-Host "    $($Config.ApiPrefix)/*  ->  Backend  (:$($Config.BackendPort))" -ForegroundColor Gray
+        Write-Host "    /*               ->  Frontend (:$($Config.FrontendPort))" -ForegroundColor Gray
     } else {
         Write-Warn "Deployment finished with errors. Check log: $($script:logFile)"
     }
@@ -3767,7 +3870,7 @@ function Show-CaddyConfig {
         if ($availableTargets.Count -gt 0) {
             $i = 1
             foreach ($t in $availableTargets) {
-                Write-Host "   $i) $($t.Name) → $($t.Target)" -ForegroundColor Gray
+                Write-Host ("   " + $i + ") " + $t.Name + " -> " + $t.Target) -ForegroundColor Gray
                 $i++
             }
         } else {
@@ -3776,7 +3879,7 @@ function Show-CaddyConfig {
         Write-Host ""
         Write-Host " Caddy routes:" -ForegroundColor White
         for ($i = 0; $i -lt $routes.Count; $i++) {
-            Write-Host "   $($i+1)) $($routes[$i].Path) → $($routes[$i].Target)  [$($routes[$i].Label)]" -ForegroundColor Gray
+            Write-Host ("   " + ($i + 1) + ") " + $routes[$i].Path + " -> " + $routes[$i].Target + "  [" + $routes[$i].Label + "]") -ForegroundColor Gray
         }
         Write-Host ""
         Write-Host " 1) Add route to Caddy" -ForegroundColor Gray
@@ -3801,7 +3904,7 @@ function Show-CaddyConfig {
                 Write-Host "--- Add Route ---" -ForegroundColor Cyan
                 foreach ($o in $addOptions) {
                     if ($o.Target) {
-                        Write-Host " $($o.OptNum)) $($o.Name)  →  $($o.Target)" -ForegroundColor Gray
+                        Write-Host " $($o.OptNum)) $($o.Name)  ->  $($o.Target)" -ForegroundColor Gray
                     } else {
                         Write-Host " $($o.OptNum)) $($o.Name)" -ForegroundColor Gray
                     }
@@ -3839,7 +3942,7 @@ function Show-CaddyConfig {
                         $Config | Add-Member -NotePropertyName 'CaddyRoutes' -NotePropertyValue $routes -Force
                         Save-DeployConfig -Config $Config
                         $changed = $true
-                        Write-Success "Route added: $path → $targetAddr"
+                        Write-Success "Route added: $path -> $targetAddr"
                     } else {
                         Write-Err "Path must start with /"
                     }
@@ -3854,7 +3957,7 @@ function Show-CaddyConfig {
                 Write-Host ""
                 Write-Host "--- Remove Route ---" -ForegroundColor Cyan
                 for ($i = 0; $i -lt $routes.Count; $i++) {
-                    Write-Host " $($i+1)) $($routes[$i].Path) → $($routes[$i].Target)  [$($routes[$i].Label)]" -ForegroundColor Gray
+                    Write-Host " $($i+1)) $($routes[$i].Path) -> $($routes[$i].Target)  [$($routes[$i].Label)]" -ForegroundColor Gray
                 }
                 Write-Host " B) Back" -ForegroundColor Gray
                 $pick = Read-Host "`nSelect route to remove"
@@ -3862,7 +3965,7 @@ function Show-CaddyConfig {
                 if ($pick -match '^\d+$') {
                     $idx = [int]$pick - 1
                     if ($idx -ge 0 -and $idx -lt $routes.Count) {
-                        if (Confirm-Step "Remove route '$($routes[$idx].Path) → $($routes[$idx].Target)'?" -DefaultYes:$false) {
+                        if (Confirm-Step "Remove route '$($routes[$idx].Path) -> $($routes[$idx].Target)'?" -DefaultYes:$false) {
                             $routes = @($routes | Where-Object { $_ -ne $routes[$idx] })
                             if ($routes.Count -gt 0) {
                                 $Config | Add-Member -NotePropertyName 'CaddyRoutes' -NotePropertyValue $routes -Force
