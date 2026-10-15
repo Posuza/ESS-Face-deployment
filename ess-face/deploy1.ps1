@@ -12,7 +12,7 @@
 #
 # Files created next to this script:
 #   deploy.config.json          - non-secret settings (install path, ports, repos)
-#   deploy.secrets.json         - DB credentials (auto-added to .gitignore)
+#   deploy.secrets.json         - DB and SMTP credentials (auto-added to .gitignore)
 #   deploy.secrets.example.json - template with placeholder values
 # Runtime deployment state:
 #   <InstallRoot>\deployment-state.json - last two known-good deployment versions
@@ -1102,8 +1102,8 @@ function Save-CaddyRollbackPoint {
 }
 
 # ===========================================================
-# SECRETS (DB credentials, stored outside the script)
-# Nested structure: db.host, db.port, db.name, db.user, db.password
+# SECRETS (DB and SMTP credentials, stored outside the script)
+# Nested structure: db.* and smtp.host, smtp.port, smtp.user, smtp.pass, smtp.from
 # ===========================================================
 function Protect-SecretsFile {
     param([string]$Path = $SecretsPath)
@@ -1133,6 +1133,13 @@ function Get-SecretsDefaults {
             name     = "REPLACE_WITH_DB_NAME"
             user     = "REPLACE_WITH_DB_USER"
             password = "REPLACE_WITH_DB_PASSWORD"
+        }
+        smtp = [PSCustomObject]@{
+            host = "smtp.gmail.com"
+            port = 587
+            user = "REPLACE_WITH_SMTP_EMAIL"
+            pass = "REPLACE_WITH_SMTP_APP_PASSWORD"
+            from = "REPLACE_WITH_FROM_EMAIL"
         }
     }
 }
@@ -1180,6 +1187,21 @@ function Invoke-SecretsPrompt {
     $Secrets.db.user = Read-WithDefault -Default $Secrets.db.user -Prompt "  DB user"
     $Secrets.db.password = Read-WithDefault -Default $Secrets.db.password -Prompt "  DB password" -Mask
 
+    # --- SMTP section ---
+    if (-not $Secrets.smtp) {
+        $Secrets | Add-Member -MemberType NoteProperty -Name smtp -Value ([PSCustomObject]@{
+            host = "smtp.gmail.com"; port = 587; user = ""; pass = ""; from = ""
+        })
+    }
+    Write-Host ""
+    Write-Host " [SMTP]" -ForegroundColor Magenta
+    $Secrets.smtp.host = Read-WithDefault -Default $Secrets.smtp.host -Prompt "  SMTP host"
+    $smtpPort = Read-WithDefault -Default $Secrets.smtp.port -Prompt "  SMTP port"
+    $Secrets.smtp.port = [int]$smtpPort
+    $Secrets.smtp.user = Read-WithDefault -Default $Secrets.smtp.user -Prompt "  SMTP email"
+    $Secrets.smtp.pass = Read-WithDefault -Default $Secrets.smtp.pass -Prompt "  SMTP app password" -Mask
+    $Secrets.smtp.from = Read-WithDefault -Default $Secrets.smtp.from -Prompt "  From email"
+
     # Save back to JSON
     $json = $Secrets | ConvertTo-Json -Depth 4
     Set-Content -Path $SecretsPath -Value $json -Force
@@ -1218,6 +1240,9 @@ function Get-SecretsOrInitialize {
         if ($s.db.user     -match $placeholderPattern) { $placeholders += '  db.user (e.g. "root")' }
         if ($s.db.name     -match $placeholderPattern) { $placeholders += '  db.name (e.g. "ess")' }
         if ($s.db.password -match $placeholderPattern) { $placeholders += '  db.password (your MySQL password)' }
+        if ($s.smtp.user -match $placeholderPattern) { $placeholders += '  smtp.user (your SMTP login email)' }
+        if ($s.smtp.pass -match $placeholderPattern) { $placeholders += '  smtp.pass (your SMTP app password)' }
+        if ($s.smtp.from -match $placeholderPattern) { $placeholders += '  smtp.from (the sender email address)' }
 
         if ($placeholders.Count -gt 0) {
             Write-Host ""
@@ -1235,6 +1260,9 @@ function Get-SecretsOrInitialize {
             Write-Host "  db.user     (your MySQL user)" -ForegroundColor Gray
             Write-Host "  db.name     (your MySQL database name)" -ForegroundColor Gray
             Write-Host "  db.password (your MySQL password)" -ForegroundColor Gray
+            Write-Host "  smtp.user   (your SMTP login email)" -ForegroundColor Gray
+            Write-Host "  smtp.pass   (your SMTP app password)" -ForegroundColor Gray
+            Write-Host "  smtp.from   (the sender email address)" -ForegroundColor Gray
             Write-Host ""
 
             if (-not $script:headless) {
@@ -2357,6 +2385,11 @@ function Install-Backend {
         $envDbName   = $Secrets.db.name.Replace('\', '\\').Replace('"', '\"')
         $envDbPort   = [int]$Secrets.db.port
         $envFrontendUrl = (Get-FrontendPublicUrl -Config $Config).Replace('\', '\\').Replace('"', '\"')
+        $envSmtpHost = if ($Secrets.smtp -and $Secrets.smtp.host) { "$($Secrets.smtp.host)" } else { "smtp.gmail.com" }
+        $envSmtpPort = if ($Secrets.smtp -and $Secrets.smtp.port) { [int]$Secrets.smtp.port } else { 587 }
+        $envSmtpUser = if ($Secrets.smtp) { "$($Secrets.smtp.user)".Replace('\', '\\').Replace('"', '\"') } else { "" }
+        $envSmtpPass = if ($Secrets.smtp) { "$($Secrets.smtp.pass)".Replace('\', '\\').Replace('"', '\"') } else { "" }
+        $envEmailFrom = if ($Secrets.smtp) { "$($Secrets.smtp.from)".Replace('\', '\\').Replace('"', '\"') } else { "" }
 
         $envContent = @"
 DB_ENGINE=mysql
@@ -2373,6 +2406,12 @@ ACCESS_TOKEN_EXPIRE_MINUTES=30
 FRONTEND_URL="$envFrontendUrl"
 RESET_EXPIRE_MINUTES=15
 MFA_ISSUER_NAME="FaceScan ESS"
+
+SMTP_HOST=$envSmtpHost
+SMTP_PORT=$envSmtpPort
+SMTP_USER="$envSmtpUser"
+SMTP_PASS="$envSmtpPass"
+EMAIL_FROM="$envEmailFrom"
 
 MEDIA_STORAGE_PATH="$envMediaStoragePath"
 "@

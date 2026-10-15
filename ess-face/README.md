@@ -42,13 +42,14 @@ Ready-to-use profiles are provided in `deploy.production.config.json` and
 `deploy.development.config.json`. Copy the required profile over
 `deploy.config.json` before running the deployment script.
 
-### `deploy.secrets.json` — credentials (DB)
+### `deploy.secrets.json` — credentials (DB and SMTP)
 
 Auto-gitignored. Copy `deploy.secrets.example.json` → `deploy.secrets.json` to pre-fill, or enter them when the script prompts you.
 
 ```json
 {
-  "db": { "host": "localhost", "port": "3306", "name": "ess_face", "user": "root", "password": "..." }
+  "db": { "host": "localhost", "port": 3306, "name": "ess_face", "user": "root", "password": "..." },
+  "smtp": { "host": "smtp.gmail.com", "port": 587, "user": "...", "pass": "...", "from": "..." }
 }
 ```
 
@@ -60,7 +61,7 @@ Auto-gitignored. Copy `deploy.secrets.example.json` → `deploy.secrets.json` to
 
 ### 1. Prepare credentials
 
-Before running the script, make sure your DB credentials are ready.
+Before running the script, make sure your DB credentials and SMTP app password are ready.
 You can either:
 
 - **Pre-fill** `deploy.secrets.json` with your real values (copy from `deploy.secrets.example.json`)
