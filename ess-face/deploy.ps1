@@ -28,7 +28,7 @@
 param(
     [switch]$DryRun,
     [switch]$Force,
-    [ValidateSet("frontend", "backend", "caddy")]
+    [ValidateSet("frontend", "backend", "sdk", "caddy")]
     [string[]]$Components = @()
 )
 
@@ -64,8 +64,11 @@ $DefaultConfig = @{
     FrontendBranch = "main"
     BackendRepo  = "https://github.com/Posuza/ESS-Face-Backend.git"
     BackendBranch = "main"
+    SdkRepo      = "https://github.com/Posuza/EssAuth.git"
+    SdkBranch    = "release-v1"
     FrontendPort = 3110
     BackendPort  = 8110
+    SdkPort      = 7110
     CaddyPort    = 9110
     CaddyAdminPort = 2110
     ApiPrefix    = "/api/v1"
@@ -318,10 +321,13 @@ function Get-DeployConfig {
             'InstallRoot',
             'FrontendBranch',
             'BackendBranch',
+            'SdkRepo',
+            'SdkBranch',
             'CaddyPort',
             'CaddyAdminPort',
             'FrontendPort',
             'BackendPort',
+            'SdkPort',
             'FrontendPublicUrl',
             'MediaStoragePath'
         ) | ForEach-Object {
@@ -623,6 +629,19 @@ function Get-FrontendDeploymentFingerprint {
     return (Get-TextSha256 -Text $payload)
 }
 
+function Get-SdkDeploymentFingerprint {
+    param($Config)
+
+    $payload = [ordered]@{
+        repo              = "$($Config.SdkRepo)"
+        branch            = "$($Config.SdkBranch)"
+        port              = [int]$Config.SdkPort
+        frontendPublicUrl = "$(Get-FrontendPublicUrl -Config $Config)"
+    } | ConvertTo-Json -Compress
+
+    return (Get-TextSha256 -Text $payload)
+}
+
 function Get-BackendDeploymentFingerprint {
     param($Config, $Secrets)
 
@@ -680,8 +699,13 @@ function New-EmptyDeploymentComponents {
     return [PSCustomObject]@{
         frontend = [PSCustomObject]@{ current = $null; previous = $null }
         backend  = [PSCustomObject]@{ current = $null; previous = $null }
+        sdk      = [PSCustomObject]@{ current = $null; previous = $null }
         caddy    = [PSCustomObject]@{ current = $null; previous = $null }
     }
+}
+
+function Get-DeploymentComponentKeys {
+    return @("frontend", "backend", "sdk", "caddy")
 }
 
 function Get-DeploymentState {
@@ -739,6 +763,7 @@ function Test-ComponentInstalled {
     switch ($Component) {
         "frontend" { return [bool]($svc -and (Test-Path (Join-Path $base "repo\.git"))) }
         "backend"  { return [bool]($svc -and (Test-Path (Join-Path $base "repo\.git"))) }
+        "sdk"      { return [bool]($svc -and (Test-Path (Join-Path $base "repo\.git")) -and (Test-Path (Join-Path $base "repo\cdn\v1\index.js"))) }
         "caddy"    { return [bool]($svc -and (Test-Path (Join-Path $base "caddy.exe"))) }
     }
     return $false
@@ -746,7 +771,7 @@ function Test-ComponentInstalled {
 
 function Test-AnyComponentInstalled {
     param($Config)
-    foreach ($key in @("frontend","backend","caddy")) {
+    foreach ($key in (Get-DeploymentComponentKeys)) {
         if (Test-ComponentInstalled -Config $Config -Component $key) { return $true }
     }
     return $false
@@ -754,7 +779,7 @@ function Test-AnyComponentInstalled {
 
 function Test-AllComponentsInstalled {
     param($Config)
-    foreach ($key in @("frontend","backend","caddy")) {
+    foreach ($key in (Get-DeploymentComponentKeys)) {
         if (-not (Test-ComponentInstalled -Config $Config -Component $key)) { return $false }
     }
     return $true
@@ -857,7 +882,7 @@ function Test-FullDeploymentHasChanges {
     }
 
     $current = @($state.deploymentVersions)[0]
-    foreach ($key in @("frontend","backend","caddy")) {
+    foreach ($key in (Get-DeploymentComponentKeys)) {
         if (-not $script:deploymentCandidates.ContainsKey($key)) { continue }
         $candidate = "$($script:deploymentCandidates[$key])".Trim()
         $old = "$($current.components.$key.current)".Trim()
@@ -875,7 +900,7 @@ function Complete-FullDeploymentState {
 
     if (-not $existing) {
         $components = New-EmptyDeploymentComponents
-        foreach ($key in @("frontend","backend","caddy")) {
+        foreach ($key in (Get-DeploymentComponentKeys)) {
             if ($script:deploymentCandidates.ContainsKey($key)) {
                 $components.$key.current = "$($script:deploymentCandidates[$key])"
             }
@@ -904,7 +929,7 @@ function Complete-FullDeploymentState {
     $newVersion = Copy-ObjectDeep -Object $oldVersion
     $newVersion.versionName = Get-NextDeploymentVersionName -State $state
 
-    foreach ($key in @("frontend","backend","caddy")) {
+    foreach ($key in (Get-DeploymentComponentKeys)) {
         if (-not $script:deploymentCandidates.ContainsKey($key)) { continue }
 
         $candidate = "$($script:deploymentCandidates[$key])".Trim()
@@ -1700,6 +1725,7 @@ function Verify-Health {
     $allOk = $true
     $backendSvcName = Get-DeployServiceName -Config $Config -Component "backend"
     $frontendSvcName = Get-DeployServiceName -Config $Config -Component "frontend"
+    $sdkSvcName = Get-DeployServiceName -Config $Config -Component "sdk"
     $caddySvcName = Get-DeployServiceName -Config $Config -Component "caddy"
     Write-Step "Verifying service health"
 
@@ -1709,10 +1735,14 @@ function Verify-Health {
     if (Get-Service -Name $frontendSvcName -ErrorAction SilentlyContinue) {
         if (-not (Test-Endpoint -Url "http://localhost:$($Config.FrontendPort)" -Name "Frontend")) { $allOk = $false }
     }
+    if (Get-Service -Name $sdkSvcName -ErrorAction SilentlyContinue) {
+        if (-not (Test-Endpoint -Url "http://localhost:$($Config.SdkPort)/v1/index.js" -Name "EssAuth SDK")) { $allOk = $false }
+    }
     if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
         $caddyPorts = Get-CaddyActualPorts -Config $Config
         $caddyProxyPort = $caddyPorts.proxy
         if (-not (Test-Endpoint -Url "http://localhost:${caddyProxyPort}$($Config.ApiPrefix)/health" -Name "Caddy proxy")) { $allOk = $false }
+        if (-not (Test-Endpoint -Url "http://localhost:${caddyProxyPort}/sdk/v1/index.js" -Name "Caddy SDK route")) { $allOk = $false }
     }
 
     # Show port summary after health checks
@@ -1720,6 +1750,7 @@ function Verify-Health {
     Write-Host " -- Ports --" -ForegroundColor Cyan
     Write-Host "  Frontend : $($Config.FrontendPort)" -ForegroundColor Green
     Write-Host "  Backend  : $($Config.BackendPort)" -ForegroundColor Green
+    Write-Host "  SDK      : $($Config.SdkPort)" -ForegroundColor Green
     if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
         $caddyPorts = Get-CaddyActualPorts -Config $Config
         Write-Host "  Caddy proxy : $($caddyPorts.proxy)" -ForegroundColor Green
@@ -2622,6 +2653,205 @@ catch {
     }
 }
 
+function Set-SdkDeploymentOrigin {
+    param(
+        $Config,
+        [Parameter(Mandatory=$true)][string]$RepoDir
+    )
+
+    $origin = (Get-FrontendPublicUrl -Config $Config).Trim().TrimEnd('/')
+    try {
+        $uri = [System.Uri]$origin
+    }
+    catch {
+        throw "FrontendPublicUrl is not a valid absolute URL: $origin"
+    }
+
+    if (
+        -not $uri.IsAbsoluteUri -or
+        $uri.Scheme -notin @('http', 'https') -or
+        $uri.AbsolutePath -ne '/' -or
+        -not [string]::IsNullOrWhiteSpace($uri.Query) -or
+        -not [string]::IsNullOrWhiteSpace($uri.Fragment)
+    ) {
+        throw "FrontendPublicUrl must be an HTTP(S) origin without a path: $origin"
+    }
+
+    $configPath = Join-Path $RepoDir "src\internal\core\config.ts"
+    if (-not (Test-Path $configPath)) { throw "SDK origin config was not found: $configPath" }
+
+    $content = Get-Content -Path $configPath -Raw
+    $pattern = 'const ESS_ORIGIN = "https?://[^"/]+";'
+    if ($content -notmatch $pattern) { throw "Could not locate ESS_ORIGIN in $configPath" }
+
+    $replacement = 'const ESS_ORIGIN = "' + $uri.GetLeftPart([System.UriPartial]::Authority) + '";'
+    Set-Content -Path $configPath -Value ([regex]::Replace($content, $pattern, $replacement, 1)) -Encoding UTF8 -Force
+    Write-Log "SDK deployment origin set to $($uri.GetLeftPart([System.UriPartial]::Authority))"
+}
+
+function Install-Sdk {
+    param($Config)
+    Initialize-InstallRoot -Config $Config
+
+    $appDir = Join-Path $Config.InstallRoot "sdk"
+    $repoDir = Join-Path $appDir "repo"
+    $svcName = Get-DeployServiceName -Config $Config -Component "sdk"
+    $appPort = [int]$Config.SdkPort
+    $logsDir = Join-Path (Join-Path $Config.InstallRoot "logs") "sdk"
+    New-Item -Path $logsDir -ItemType Directory -Force | Out-Null
+
+    $wasInstalled = Test-ComponentInstalled -Config $Config -Component "sdk"
+    $action = if ($wasInstalled) { "Updating" } else { "Installing" }
+    Write-Step "$action EssAuth SDK"
+
+    if ($script:dryRun) {
+        Write-Warn "[DRY-RUN] Would $($action.ToLower()) SDK from $($Config.SdkRepo), branch $($Config.SdkBranch), on port $appPort"
+        return $true
+    }
+
+    $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+    $installLog = Join-Path $logsDir "sdk_${ts}.log"
+    $oldGood = Get-DeploymentComponentCurrent -Config $Config -Component "sdk"
+    if ([string]::IsNullOrWhiteSpace($oldGood) -and (Test-Path (Join-Path $repoDir ".git"))) {
+        $oldGood = Get-GitHead -RepoDir $repoDir
+    }
+
+    $sdkFingerprint = Get-SdkDeploymentFingerprint -Config $Config
+    $savedSdkFingerprint = Get-SavedComponentFingerprint -Config $Config -Component "sdk"
+    $sdkConfigChanged = ($savedSdkFingerprint -ne $sdkFingerprint)
+    $liveSdkChanged = $false
+
+    try {
+        New-Item -Path $appDir -ItemType Directory -Force | Out-Null
+
+        if (Test-Path (Join-Path $repoDir ".git")) {
+            $currentOrigin = (& git -C $repoDir remote get-url origin 2>$null | Select-Object -First 1)
+            if ("$currentOrigin".Trim() -ne "$($Config.SdkRepo)".Trim()) {
+                & git -C $repoDir remote set-url origin $Config.SdkRepo
+                if ($LASTEXITCODE -ne 0) { throw "Could not update SDK Git origin URL." }
+                $sdkConfigChanged = $true
+            }
+
+            git -C $repoDir fetch --prune origin "+refs/heads/$($Config.SdkBranch):refs/remotes/origin/$($Config.SdkBranch)" 2>&1 |
+                Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "SDK branch '$($Config.SdkBranch)' could not be fetched." }
+
+            $localHead = Get-GitHead -RepoDir $repoDir
+            $remoteHead = (& git -C $repoDir rev-parse "origin/$($Config.SdkBranch)" 2>$null | Select-Object -First 1).Trim()
+            if ($wasInstalled -and $localHead -eq $remoteHead -and -not $sdkConfigChanged) {
+                Write-Success "SDK code and deployment configuration are already current: $localHead"
+                Register-SuccessfulComponentDeployment -Config $Config -Component "sdk" -Commit $localHead
+                return $true
+            }
+
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Stopped') {
+                Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+            }
+
+            $liveSdkChanged = $true
+            $script:liveComponentsChanged += "sdk"
+            git -C $repoDir reset --hard "origin/$($Config.SdkBranch)" 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "SDK git reset failed." }
+            git -C $repoDir clean -fd 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "SDK git clean failed." }
+        }
+        else {
+            if (Test-Path $repoDir) { Remove-Item -Path $repoDir -Recurse -Force }
+            git clone --branch $Config.SdkBranch $Config.SdkRepo $repoDir 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "SDK git clone failed." }
+        }
+
+        $candidate = Get-GitHead -RepoDir $repoDir
+        if ([string]::IsNullOrWhiteSpace($candidate)) { throw "Could not determine SDK Git HEAD." }
+
+        Set-SdkDeploymentOrigin -Config $Config -RepoDir $repoDir
+
+        Push-Location $repoDir
+        try {
+            npm install 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "SDK npm install failed." }
+
+            npm run publish:cdn 2>&1 | Add-FileLog -Path $installLog
+            if ($LASTEXITCODE -ne 0) { throw "SDK build failed." }
+
+            $serveMain = Join-Path $repoDir "node_modules\serve\build\main.js"
+            if (-not (Test-Path $serveMain)) {
+                npm install --no-save serve 2>&1 | Add-FileLog -Path $installLog
+                if ($LASTEXITCODE -ne 0) { throw "SDK serve package installation failed." }
+            }
+        }
+        finally {
+            Pop-Location
+        }
+
+        $sdkEntry = Join-Path $repoDir "cdn\v1\index.js"
+        if (-not (Test-Path $sdkEntry)) { throw "SDK build did not create cdn\v1\index.js." }
+
+        $runnerScript = Join-Path $appDir "sdk-run.ps1"
+        $runnerContent = @'
+$ErrorActionPreference = "Stop"
+$sdkDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoDir = Join-Path $sdkDir "repo"
+$cdnDir = Join-Path $repoDir "cdn"
+$serveMain = Join-Path $repoDir "node_modules\serve\build\main.js"
+$logsDir = Join-Path (Join-Path (Split-Path $sdkDir -Parent) "logs") "sdk"
+if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Path $logsDir -Force | Out-Null }
+$serviceLog = Join-Path $logsDir ("sdk_service_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+function Log([string]$m) { "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),$m | Add-Content -Path $serviceLog }
+try {
+    if (-not (Test-Path (Join-Path $cdnDir "v1\index.js"))) { throw "SDK entry not found in $cdnDir" }
+    if (-not (Test-Path $serveMain)) { throw "serve not found: $serveMain" }
+    $node = (Get-Command node.exe -ErrorAction Stop).Source
+    Log "Serving $cdnDir on __SDK_PORT__"
+    & $node $serveMain $cdnDir -l "__SDK_PORT__" --no-clipboard 2>&1 | ForEach-Object { Log "$_" }
+    exit $LASTEXITCODE
+} catch {
+    Log "ERROR: $($_.Exception.Message)"
+    exit 1
+}
+'@
+        $runnerContent = $runnerContent.Replace('__SDK_PORT__', "$appPort")
+        Set-Content -Path $runnerScript -Value $runnerContent -Encoding UTF8 -Force
+
+        if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) {
+            $powershellExe = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            $paramStr = "-ExecutionPolicy Bypass -File `"$runnerScript`""
+            servy-cli install --name="$svcName" --path="$powershellExe" --params="$paramStr" 2>&1 |
+                Add-FileLog -Path $installLog
+            if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) { throw "SDK service creation failed." }
+            sc.exe config "$svcName" start= delayed-auto | Out-Null
+            sc.exe failure "$svcName" reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
+            sc.exe failureflag "$svcName" 1 | Out-Null
+            Write-Success "SDK service created"
+        }
+
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Stopped') { Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue }
+        Start-Service -Name $svcName -ErrorAction Stop
+
+        if (-not (Test-Endpoint -Url "http://127.0.0.1:$appPort/v1/index.js" -Name "EssAuth SDK" -Retries 10 -RetryDelaySec 2)) {
+            throw "SDK service did not pass health check."
+        }
+
+        Register-SuccessfulComponentDeployment -Config $Config -Component "sdk" -Commit $candidate
+        Save-ComponentFingerprint -Config $Config -Component "sdk" -Fingerprint $sdkFingerprint
+        if ($sdkConfigChanged) { $script:deploymentConfigChanged = $true }
+        $script:installedComponents += "sdk"
+        Write-Success "SDK update successful: $candidate"
+        return $true
+    }
+    catch {
+        Write-Err "SDK setup failed: $_"
+        if ($liveSdkChanged -and -not [string]::IsNullOrWhiteSpace($oldGood)) {
+            Write-Warn "Restoring known-good SDK commit: $oldGood"
+            Invoke-SdkRollbackToCommit -Config $Config -Commit $oldGood | Out-Null
+        }
+        return $false
+    }
+}
+
 function Install-Caddy {
     param($Config)
     Initialize-InstallRoot -Config $Config
@@ -2698,6 +2928,11 @@ function Install-Caddy {
         $caddyfilePath = Join-Path $caddyDir "Caddyfile"
         $caddyfileLines = @()
         $caddyfileLines += ":`{`$CADDY_PORT`} {"
+        $caddyfileLines += "    handle_path /sdk/* {"
+        $caddyfileLines += "        header Access-Control-Allow-Origin `"*`""
+        $caddyfileLines += "        header Cache-Control `"no-cache, no-store, must-revalidate`""
+        $caddyfileLines += "        reverse_proxy 127.0.0.1:$($Config.SdkPort)"
+        $caddyfileLines += "    }"
         foreach ($r in $caddyRoutes) {
             $caddyfileLines += "    handle $($r.Path) {"
             $caddyfileLines += "        reverse_proxy $($r.Target)"
@@ -2909,6 +3144,10 @@ function Install-Caddy {
             }
             if (-not (Test-PortInUse -Port $Config.CaddyAdminPort)) {
                 throw "Caddy admin API port $($Config.CaddyAdminPort) is not listening after startup."
+            }
+
+            if (-not (Test-Endpoint -Url "http://127.0.0.1:$($Config.CaddyPort)/sdk/v1/index.js" -Name "Caddy SDK route" -Retries 7 -RetryDelaySec 2)) {
+                throw "Caddy could not serve the EssAuth SDK route."
             }
 
             Write-Success "Caddy is listening on fixed ports: proxy=$($Config.CaddyPort), admin=$($Config.CaddyAdminPort)"
@@ -3172,6 +3411,63 @@ function Invoke-BackendRollbackToCommit {
     }
 }
 
+function Invoke-SdkRollbackToCommit {
+    param($Config, [Parameter(Mandatory=$true)][string]$Commit)
+
+    $appDir = Join-Path $Config.InstallRoot "sdk"
+    $repoDir = Join-Path $appDir "repo"
+    $svcName = Get-DeployServiceName -Config $Config -Component "sdk"
+    if (-not (Test-Path (Join-Path $repoDir ".git"))) { Write-Warn "SDK repo not found."; return $false }
+
+    try {
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Stopped') {
+            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+        }
+
+        if (-not (Ensure-GitCommitAvailable -RepoDir $repoDir -Commit $Commit)) {
+            throw "SDK rollback commit is unavailable: $Commit"
+        }
+
+        git -C $repoDir reset --hard $Commit | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "SDK git reset failed." }
+
+        Set-SdkDeploymentOrigin -Config $Config -RepoDir $repoDir
+
+        Push-Location $repoDir
+        try {
+            npm install | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "SDK rollback npm install failed." }
+            npm run publish:cdn | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "SDK rollback build failed." }
+            if (-not (Test-Path (Join-Path $repoDir "node_modules\serve\build\main.js"))) {
+                npm install --no-save serve | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "SDK rollback serve install failed." }
+            }
+        }
+        finally {
+            Pop-Location
+        }
+
+        if (-not (Test-Path (Join-Path $repoDir "cdn\v1\index.js"))) {
+            throw "SDK rollback build did not create cdn\v1\index.js."
+        }
+
+        Start-Service -Name $svcName -ErrorAction Stop
+        if (-not (Test-Endpoint -Url "http://127.0.0.1:$($Config.SdkPort)/v1/index.js" -Name "SDK restored" -Retries 7 -RetryDelaySec 2)) {
+            throw "SDK rollback health check failed."
+        }
+
+        Write-Success "SDK restored to Git commit: $Commit"
+        return $true
+    }
+    catch {
+        Write-Err "SDK rollback failed: $_"
+        return $false
+    }
+}
+
 function Invoke-CaddyRollbackToCommit {
     param($Config, [Parameter(Mandatory=$true)][string]$Commit)
 
@@ -3213,6 +3509,8 @@ function Invoke-CaddyRollbackToCommit {
         Start-Service -Name $svcName -ErrorAction Stop
         $ok = Test-Endpoint -Url "http://127.0.0.1:$($Config.CaddyPort)$($Config.ApiPrefix)/health" -Name "Caddy proxy" -TimeoutSec 5 -Retries 7 -RetryDelaySec 2
         if (-not $ok) { throw "Caddy rollback health check failed." }
+        $sdkOk = Test-Endpoint -Url "http://127.0.0.1:$($Config.CaddyPort)/sdk/v1/index.js" -Name "Caddy SDK route" -TimeoutSec 5 -Retries 7 -RetryDelaySec 2
+        if (-not $sdkOk) { throw "Caddy rollback SDK route health check failed." }
 
         Write-Success "Caddy restored to local Git commit: $Commit"
         return $true
@@ -3231,6 +3529,7 @@ function Invoke-SelectedRollback {
     switch ($Key) {
         "frontend" { return Invoke-FrontendRollbackToCommit -Config $Config -Commit $Commit }
         "backend"  { return Invoke-BackendRollbackToCommit -Config $Config -Commit $Commit }
+        "sdk"      { return Invoke-SdkRollbackToCommit -Config $Config -Commit $Commit }
         "caddy"    { return Invoke-CaddyRollbackToCommit -Config $Config -Commit $Commit }
         default    { Write-Warn "Unknown rollback component: $Key"; return $false }
     }
@@ -3257,7 +3556,7 @@ function Show-RollbackMenu {
     Write-Host " Previous: $($target.versionName)" -ForegroundColor Gray
     Write-Host ""
 
-    foreach ($key in @("frontend","backend","caddy")) {
+    foreach ($key in (Get-DeploymentComponentKeys)) {
         Write-Host " $key" -ForegroundColor White
         Write-Host "   current target : $($current.components.$key.current)" -ForegroundColor Green
         Write-Host "   rollback target: $($target.components.$key.current)" -ForegroundColor Gray
@@ -3271,7 +3570,7 @@ function Show-RollbackMenu {
     $restored = @()
     $ok = $true
 
-    foreach ($key in @("caddy","backend","frontend")) {
+    foreach ($key in @("caddy","sdk","backend","frontend")) {
         $commit = "$($target.components.$key.current)".Trim()
         if ([string]::IsNullOrWhiteSpace($commit)) { continue }
 
@@ -3285,7 +3584,7 @@ function Show-RollbackMenu {
 
     if (-not $ok) {
         Write-Warn "Rollback did not complete. Restoring the original current deployment where possible..."
-        foreach ($key in @("caddy","backend","frontend")) {
+        foreach ($key in @("caddy","sdk","backend","frontend")) {
             if ($restored -notcontains $key) { continue }
             $commit = "$($current.components.$key.current)".Trim()
             if (-not [string]::IsNullOrWhiteSpace($commit)) {
@@ -3315,7 +3614,7 @@ function Invoke-Rollback {
 
     Write-Step "RESTORING previous known-good deployment"
     $ok = $true
-    foreach ($key in @("caddy","backend","frontend")) {
+    foreach ($key in @("caddy","sdk","backend","frontend")) {
         $commit = "$($previous.components.$key.current)".Trim()
         if ([string]::IsNullOrWhiteSpace($commit)) { continue }
         if (-not (Invoke-SelectedRollback -Config $Config -Key $key -Commit $commit)) { $ok = $false }
@@ -3333,7 +3632,8 @@ function Get-Components {
     return @(
         [PSCustomObject]@{ Num = 1; Key = "frontend"; Service = (Get-DeployServiceName -Config $Config -Component "frontend"); Display = "Frontend (Node / Vite)" }
         [PSCustomObject]@{ Num = 2; Key = "backend";  Service = (Get-DeployServiceName -Config $Config -Component "backend");  Display = "Backend (FastAPI)" }
-        [PSCustomObject]@{ Num = 3; Key = "caddy";    Service = (Get-DeployServiceName -Config $Config -Component "caddy");    Display = "Caddy reverse proxy" }
+        [PSCustomObject]@{ Num = 3; Key = "sdk";      Service = (Get-DeployServiceName -Config $Config -Component "sdk");      Display = "EssAuth SDK (Node static)" }
+        [PSCustomObject]@{ Num = 4; Key = "caddy";    Service = (Get-DeployServiceName -Config $Config -Component "caddy");    Display = "Caddy reverse proxy" }
     )
 }
 
@@ -3360,6 +3660,7 @@ function Invoke-ComponentInstall {
             }
             $result = Install-Backend -Config $Config -Secrets $secrets
         }
+        "sdk"        { $result = Install-Sdk -Config $Config }
         "caddy"      { $result = Install-Caddy -Config $Config }
     }
     if (-not $result -and -not $script:dryRun) {
@@ -3541,6 +3842,7 @@ function Start-AllServices {
             switch ($c.Key) {
                 "frontend" { Write-Host "    Address: http://localhost:$($Config.FrontendPort)" -ForegroundColor Gray }
                 "backend"  { Write-Host "    Address: http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)" -ForegroundColor Gray }
+                "sdk"      { Write-Host "    Address: http://localhost:$($Config.SdkPort)/v1/index.js" -ForegroundColor Gray }
             }
             Write-Log "Service started: $($c.Service)"
         } catch {
@@ -3596,6 +3898,7 @@ function Show-Status {
     Write-Host " -- Addresses --" -ForegroundColor Cyan
     Write-Host "  Frontend : http://localhost:$($Config.FrontendPort)" -ForegroundColor Green
     Write-Host "  Backend  : http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)" -ForegroundColor Green
+    Write-Host "  SDK      : http://localhost:$($Config.SdkPort)/v1/index.js" -ForegroundColor Green
     if (Get-Service -Name $caddySvcName -ErrorAction SilentlyContinue) {
         $caddyPorts = Get-CaddyActualPorts -Config $Config
         Write-Host "  Caddy proxy : http://localhost:$($caddyPorts.proxy)" -ForegroundColor Green
@@ -3666,7 +3969,7 @@ function Invoke-FullDeploy {
     $targetComponents = if ($script:headless -and $Components.Count -gt 0) {
         $Components
     } else {
-        @("frontend", "backend", "caddy")
+        @("frontend", "backend", "sdk", "caddy")
     }
     $allSucceeded = $true
 
@@ -3716,6 +4019,20 @@ function Invoke-FullDeploy {
             Write-Log "Backend installed on port $($Config.BackendPort)"
         } else {
             Write-Err "Backend installation FAILED - skipping remaining components"
+            $allSucceeded = $false
+        }
+    }
+
+    if ($allSucceeded -and $targetComponents -contains "sdk") {
+        Write-Host "  EssAuth SDK (port $($Config.SdkPort))..." -ForegroundColor Gray
+        Start-Spinner "SDK deployment ..."
+        $sdkOk = Install-Sdk -Config $Config
+        Stop-Spinner
+        if ($sdkOk) {
+            Write-Success "EssAuth SDK ready on port $($Config.SdkPort)"
+            Write-Log "EssAuth SDK installed on port $($Config.SdkPort)"
+        } else {
+            Write-Err "SDK installation FAILED - skipping remaining components"
             $allSucceeded = $false
         }
     }
@@ -3805,16 +4122,15 @@ function Invoke-FullDeploy {
         Write-Host "  +--------------------------------------------------+" -ForegroundColor Cyan
         Write-Host "  |                   CADDY                         |" -ForegroundColor Cyan
         Write-Host "  |             (port ${displayCaddyPort})                |" -ForegroundColor Cyan
-        Write-Host "  +--------+-------------------------+---------------+" -ForegroundColor Cyan
-        Write-Host "           |                         |" -ForegroundColor Cyan
-        Write-Host "           v                         v" -ForegroundColor Cyan
-        Write-Host "  +----------------+        +------------------+" -ForegroundColor Cyan
-        Write-Host "  |   FRONTEND     |        |     BACKEND      |" -ForegroundColor Cyan
-        Write-Host "  |  (port $($Config.FrontendPort))    |        |    (port $($Config.BackendPort))     |" -ForegroundColor Cyan
-        Write-Host "  +----------------+        +------------------+" -ForegroundColor Cyan
+        Write-Host "  +---------------+----------------+-----------------+" -ForegroundColor Cyan
+        Write-Host "          |               |                |" -ForegroundColor Cyan
+        Write-Host "          v               v                v" -ForegroundColor Cyan
+        Write-Host "     FRONTEND          BACKEND          ESSAUTH SDK" -ForegroundColor Cyan
+        Write-Host "       :$($Config.FrontendPort)             :$($Config.BackendPort)             :$($Config.SdkPort)" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "  Browser -> http://localhost:${displayCaddyPort}  ->  Caddy routes:" -ForegroundColor White
         Write-Host "    $($Config.ApiPrefix)/*  ->  Backend  (:$($Config.BackendPort))" -ForegroundColor Gray
+        Write-Host "    /sdk/*           ->  SDK      (:$($Config.SdkPort))" -ForegroundColor Gray
         Write-Host "    /*               ->  Frontend (:$($Config.FrontendPort))" -ForegroundColor Gray
     } else {
         Write-Warn "Deployment finished with errors. Check log: $($script:logFile)"
@@ -3917,6 +4233,7 @@ function Show-CaddyConfig {
         }
         Write-Host ""
         Write-Host " Caddy routes:" -ForegroundColor White
+        Write-Host "   SDK) /sdk/* -> 127.0.0.1:$($Config.SdkPort)  [EssAuth SDK, managed]" -ForegroundColor Gray
         for ($i = 0; $i -lt $routes.Count; $i++) {
             Write-Host ("   " + ($i + 1) + ") " + $routes[$i].Path + " -> " + $routes[$i].Target + "  [" + $routes[$i].Label + "]") -ForegroundColor Gray
         }
@@ -4047,6 +4364,11 @@ function Show-CaddyConfig {
 
                 $caddyfileLines = @()
                 $caddyfileLines += ":`{`$CADDY_PORT`} {"
+                $caddyfileLines += "    handle_path /sdk/* {"
+                $caddyfileLines += "        header Access-Control-Allow-Origin `"*`""
+                $caddyfileLines += "        header Cache-Control `"no-cache, no-store, must-revalidate`""
+                $caddyfileLines += "        reverse_proxy 127.0.0.1:$($Config.SdkPort)"
+                $caddyfileLines += "    }"
                 foreach ($r in $finalRoutes) {
                     $caddyfileLines += "    handle $($r.Path) {"
                     $caddyfileLines += "        reverse_proxy $($r.Target)"
@@ -4224,6 +4546,7 @@ do {
             Write-Host " This will remove:" -ForegroundColor Gray
             Write-Host "   - Frontend service and files" -ForegroundColor Gray
             Write-Host "   - Backend service and files" -ForegroundColor Gray
+            Write-Host "   - EssAuth SDK service and files" -ForegroundColor Gray
             Write-Host "   - Caddy service and files" -ForegroundColor Gray
             Write-Host "   - Logs" -ForegroundColor Gray
             Write-Host "   - deployment-state.json" -ForegroundColor Gray
@@ -4325,6 +4648,7 @@ do {
                         switch ($c.Key) {
                             "frontend" { Write-Host "    Address: http://localhost:$($Config.FrontendPort)" -ForegroundColor Gray }
                             "backend"  { Write-Host "    Address: http://localhost:$($Config.BackendPort)$($Config.ApiPrefix)" -ForegroundColor Gray }
+                            "sdk"      { Write-Host "    Address: http://localhost:$($Config.SdkPort)/v1/index.js" -ForegroundColor Gray }
                             "caddy"    {
                                 Start-Sleep -Seconds 2
                                 $caddyPorts = Get-CaddyActualPorts -Config $Config

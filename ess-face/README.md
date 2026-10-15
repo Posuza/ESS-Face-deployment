@@ -2,7 +2,7 @@
 
 # ESS Face Deployment Manager
 
-Automates installing the **ESS Face** app (frontend + FastAPI backend + Caddy reverse proxy) as Windows services via [Servy](https://github.com/servy-community/servy).
+Automates installing the **ESS Face** app (frontend + FastAPI backend + EssAuth SDK + Caddy reverse proxy) as Windows services via [Servy](https://github.com/servy-community/servy).
 
 ---
 
@@ -16,7 +16,7 @@ Edit these **before** your first deploy if your setup differs from the defaults.
 
 Created automatically on first run. Edit it to change:
 
-> ⚠️ **Do not use ports** `80`, `443`, `8080`, `3000`, `8000`, `5000` — these are typically taken by other services (IIS, web servers, dev tools). Pick free ports instead. The Face defaults (`3110`, `8110`, `9110`, `2110`) are intentionally separate from the previous deployment ports.
+> ⚠️ **Do not use ports** `80`, `443`, `8080`, `3000`, `8000`, `5000` — these are typically taken by other services (IIS, web servers, dev tools). Pick free ports instead. The Face defaults (`3110`, `8110`, `7110`, `9110`, `2110`) are intentionally separate from the previous deployment ports.
 
 | Field | Default | What it does | Can be changed? |
 |---|---|---|---|
@@ -25,8 +25,11 @@ Created automatically on first run. Edit it to change:
 | `FrontendBranch` | `main` | Frontend Git branch to deploy | ✅ Use `ver1` for development |
 | `BackendRepo` | `Posuza/ESS-Face-Backend` | Git repo for the FastAPI backend | ✅ Replace with your own repo URL |
 | `BackendBranch` | `main` | Backend Git branch to deploy | ✅ Use `ver1` for development |
+| `SdkRepo` | `Posuza/EssAuth` | Git repo for the browser SDK | ✅ Replace with your own repo URL |
+| `SdkBranch` | `release-v1` | SDK Git branch to deploy | ✅ Change to another release branch if needed |
 | `FrontendPort` | `3110` | Port the frontend serves on | ✅ Change if needed |
 | `BackendPort` | `8110` | Port the backend API runs on | ✅ Change if needed |
+| `SdkPort` | `7110` | Internal port serving the generated SDK | ✅ Change if needed |
 | `CaddyPort` | `9110` | Port the reverse proxy listens on | ✅ Change if needed |
 | `CaddyAdminPort` | `2110` | Caddy admin API port | ✅ Change if needed |
 | `ApiPrefix` | `/api/v1` | API path prefix | ✅ Any prefix starting with `/` (e.g. `/api`, `/v2`) |
@@ -117,6 +120,7 @@ The script will:
 3. Install each component:
    - **Frontend** — clones repo, `npm install`, builds, registers as a Windows service
    - **Backend** — clones repo, cleans stale untracked files, creates venv, `pip install`, generates `.env`, creates persistent image storage, and registers the API service
+   - **EssAuth SDK** — clones or updates the SDK repo, injects `FrontendPublicUrl` as its ESS origin, builds `cdn/v1/index.js`, and registers a static-file service
    - **Caddy** — downloads Caddy, creates `Caddyfile`, registers as service
 
 Backend face profile images are stored outside the cloned backend repo and outside `Ess_Face`, so they survive reinstalling or deleting app service folders. By default the folders are:
@@ -145,6 +149,7 @@ Use **option 7** to manage which services Caddy proxies to:
    (all targets already registered)
 
  Caddy routes:
+   SDK) /sdk/*    → 127.0.0.1:7110  [EssAuth SDK, managed]
    1) /*         → 127.0.0.1:3110  [Frontend]
    2) /api/v1/*  → 127.0.0.1:8110  [Backend]
 
@@ -165,10 +170,10 @@ Use **option 7** to manage which services Caddy proxies to:
 | Option | What it does |
 |--------|-------------|
 | **1** | Check & install prerequisites (Git, Node.js, Python) |
-| **2** | Install components — pick **A** (all), **1** (Frontend), **2** (Backend), **3** (Caddy), or **B** (back) |
+| **2** | Install components — pick **A** (all), **1** (Frontend), **2** (Backend), **3** (SDK), **4** (Caddy), or **B** (back) |
 | **3** | Uninstall components — same submenu, with status indicators |
 | **4** | Show service status table + run health checks |
-| **5** | Start services — **A** (all), **1-3**, or **B** (back) |
+| **5** | Start services — **A** (all), **1-4**, or **B** (back) |
 | **6** | Stop services — same submenu |
 | **7** | Caddy proxy config — add/remove routes, change port |
 | **8** | Open logs folder in File Explorer |
