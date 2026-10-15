@@ -12,7 +12,7 @@
     "CaddyPort":  9091,
     "CaddyAdminPort":  2021,
     "ApiPrefix":  "/api/v1",
-    "FrontendPublicUrl":  "https://ess-faceregister.esscentor.com",
+    "FrontendPublicUrl":  "https://options-carpet-gravity-pickup.trycloudflare.com",
     "MediaStoragePath":  "D:\\ESS\\storage\\face-images",
     "InstallRoot":  "C:\\ESS\\Ess_Face"
 }
